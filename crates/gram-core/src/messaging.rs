@@ -3241,7 +3241,10 @@ impl Dispatcher {
         let catalog = self.store().acid().list_gift_catalog();
         let mut computed_hash: i32 = 0;
         for item in &catalog {
-            computed_hash = computed_hash.wrapping_add((item.gift_id as i32).wrapping_mul(item.star_price_units as i32));
+            let remains = (item.total_supply.unwrap_or(1000) - item.minted_count).max(0);
+            computed_hash = computed_hash
+                .wrapping_add((item.gift_id as i32).wrapping_mul(item.star_price_units as i32))
+                .wrapping_add(remains.wrapping_mul(31));
         }
 
         if hash != 0 && hash == computed_hash && !catalog.is_empty() {
@@ -3465,6 +3468,143 @@ impl Dispatcher {
         self.encode_saved_star_gifts_response(me.id, me.id, &gifts)
     }
 
+    fn write_sample_document(&self, w: &mut Writer, doc_id: i64) {
+        w.write_u32(0x8fd4_c4d8); // document#8fd4c4d8
+        w.write_i32(1); // flags: FLAG_0 thumbs present
+        w.write_i64(doc_id);
+        let ahash = doc_id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+        w.write_i64(ahash);
+        w.write_bytes(&[]);
+        w.write_i32(1730000000);
+        let (gift_mime, gift_size) = match self.store().acid().get_media_blob(doc_id) {
+            Some(b) => (b.mime_type, b.byte_size),
+            None => ("application/x-tgsticker".to_string(), 1024),
+        };
+        w.write_string(&gift_mime);
+        w.write_i64(gift_size);
+        w.write_vector_header(1);
+        w.write_u32(0xd821_4d41); // photoPathSize#d8214d41
+        w.write_string("j");
+        w.write_bytes(&[0x00, 0x80]);
+        w.write_i32(2); // dc_id
+        w.write_vector_header(2);
+        w.write_u32(0x6c37_c15c); // documentAttributeImageSize
+        w.write_i32(512);
+        w.write_i32(512);
+        w.write_u32(0x6319_d612); // documentAttributeSticker
+        w.write_i32(0);
+        w.write_string("⭐️");
+        w.write_u32(0xffb6_2b95); // inputStickerSetEmpty
+    }
+
+    fn write_unique_gift_attributes(&self, w: &mut Writer, gift_id: i64) {
+        w.write_vector_header(3); // 3 attributes
+
+        // 1. Model
+        w.write_u32(0x5652_51e2); // starGiftAttributeModel#565251e2
+        w.write_i32(0); // flags
+        w.write_string("Collectible");
+        self.write_sample_document(w, gift_id);
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 2. Pattern
+        w.write_u32(0x4e70_85ea); // starGiftAttributePattern#4e7085ea
+        w.write_string("Stars");
+        self.write_sample_document(w, gift_id.wrapping_add(1));
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 3. Backdrop
+        w.write_u32(0x9f25_04e4); // starGiftAttributeBackdrop#9f2504e4
+        w.write_string("Cosmic");
+        w.write_i32(1); // backdrop_id
+        w.write_i32(0x2a52_98); // center_color
+        w.write_i32(0x1e3c_72); // edge_color
+        w.write_i32(0xffffff);  // pattern_color
+        w.write_i32(0xffffff);  // text_color
+        w.write_u32(0xf08d_516b); // rarity
+    }
+
+    fn write_sample_attributes(&self, w: &mut Writer, gift_id: i64) {
+        w.write_vector_header(6); // 6 sample attributes
+
+        // 1. Model 1
+        w.write_u32(0x5652_51e2); // starGiftAttributeModel#565251e2
+        w.write_i32(0); // flags
+        w.write_string("Original");
+        self.write_sample_document(w, gift_id);
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 2. Model 2
+        w.write_u32(0x5652_51e2); // starGiftAttributeModel#565251e2
+        w.write_i32(0); // flags
+        w.write_string("Gold");
+        self.write_sample_document(w, gift_id.wrapping_add(1));
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 3. Pattern 1
+        w.write_u32(0x4e70_85ea); // starGiftAttributePattern#4e7085ea
+        w.write_string("Sparkles");
+        self.write_sample_document(w, gift_id.wrapping_add(2));
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 4. Pattern 2
+        w.write_u32(0x4e70_85ea); // starGiftAttributePattern#4e7085ea
+        w.write_string("Stars");
+        self.write_sample_document(w, gift_id.wrapping_add(3));
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 5. Backdrop 1
+        w.write_u32(0x9f25_04e4); // starGiftAttributeBackdrop#9f2504e4
+        w.write_string("Ocean");
+        w.write_i32(1); // backdrop_id
+        w.write_i32(0x2a52_98); // center_color
+        w.write_i32(0x1e3c_72); // edge_color
+        w.write_i32(0xffffff);  // pattern_color
+        w.write_i32(0xffffff);  // text_color
+        w.write_u32(0xf08d_516b); // rarity
+
+        // 6. Backdrop 2
+        w.write_u32(0x9f25_04e4); // starGiftAttributeBackdrop#9f2504e4
+        w.write_string("Nebula");
+        w.write_i32(2); // backdrop_id
+        w.write_i32(0x654e_a3); // center_color
+        w.write_i32(0x3219_59); // edge_color
+        w.write_i32(0xffffff);  // pattern_color
+        w.write_i32(0xffffff);  // text_color
+        w.write_u32(0xf08d_516b); // rarity
+    }
+
+    fn write_upgrade_update_message(&self, w: &mut Writer, me_id: i64, upgraded: &UserGiftRow) {
+        w.write_u32(0x1f2b_0afd); // updateNewMessage#1f2b0afd
+        w.write_u32(0x2b08_5862); // messageService#2b085862
+        let mflags = 1 << 8; // from_id
+        w.write_i32(mflags);
+        w.write_i32(upgraded.instance_id as i32); // id
+        w.write_u32(TL_PEER_USER);
+        w.write_i64(me_id);
+        w.write_u32(TL_PEER_USER);
+        w.write_i64(me_id);
+        w.write_i32(now_unix()); // date
+        w.write_u32(0xe6c3_1522); // messageActionStarGiftUnique#e6c31522
+        let aflags = 1 | (1 << 2); // upgrade:flags.0 | saved:flags.2
+        w.write_i32(aflags);
+        // gift: StarGift (starGiftUnique#85f0a9cd)
+        w.write_u32(0x85f0_a9cd);
+        w.write_i32(0); // flags
+        w.write_i64(upgraded.instance_id);
+        w.write_i64(upgraded.gift_id);
+        let title = upgraded.collectible_slug.clone().unwrap_or_else(|| "Collectible Gift".to_string());
+        w.write_string(&title);
+        let slug = upgraded.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", upgraded.instance_id));
+        w.write_string(&slug);
+        w.write_i32(upgraded.serial_number.unwrap_or(1));
+        self.write_unique_gift_attributes(w, upgraded.gift_id);
+        w.write_i32(1); // availability_issued
+        w.write_i32(1000); // availability_total
+        w.write_i32(1); // pts
+        w.write_i32(1); // pts_count
+    }
+
     fn encode_saved_star_gifts_response(&self, viewer_id: i64, owner_id: i64, gifts: &[UserGiftRow]) -> Vec<u8> {
         let mut w = Writer::new();
         w.write_u32(0x95f3_89b1); // PAYMENTS_SAVED_STAR_GIFTS
@@ -3484,7 +3624,6 @@ impl Dispatcher {
             sflags |= 1 << 11; // saved_id
             if !g.is_upgraded {
                 sflags |= 1 << 10; // can_upgrade
-                sflags |= 1 << 6;  // upgrade_stars
                 sflags |= 1 << 4;  // convert_stars
             }
             if g.is_pinned {
@@ -3515,7 +3654,7 @@ impl Dispatcher {
                 let slug = g.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", g.instance_id));
                 w.write_string(&slug);
                 w.write_i32(g.serial_number.unwrap_or(1)); // num
-                w.write_vector_header(0); // attributes
+                self.write_unique_gift_attributes(&mut w, g.gift_id);
                 w.write_i32(1); // availability_issued
                 w.write_i32(1000); // availability_total
             } else {
@@ -3574,7 +3713,7 @@ impl Dispatcher {
                 w.write_i64(conv);
             }
             // 7. upgrade_stars (if 1 << 6)
-            if !g.is_upgraded {
+            if (sflags & (1 << 6)) != 0 {
                 let (_, upg) = self.store().acid().get_gift_prices(g.gift_id).unwrap_or((50, 25));
                 w.write_i64(upg);
             }
@@ -3709,6 +3848,7 @@ impl Dispatcher {
         };
         let _form_id = r.read_i64().unwrap_or(0);
         let ctor = r.read_u32().unwrap_or(0);
+        let mut upgraded_gift = None;
         match ctor {
             // inputInvoiceStarGift#e8625e92
             0xe862_5e92 => {
@@ -3749,7 +3889,7 @@ impl Dispatcher {
                     None => return rpc_error(400, "STARGIFT_INVALID"),
                 };
                 match self.store().acid().upgrade_star_gift(me.id, instance_id) {
-                    Ok(_) => {}
+                    Ok(g) => { upgraded_gift = Some(g); }
                     Err(StoreError::InsufficientBalance) => return rpc_error(400, "BALANCE_TOO_LOW"),
                     Err(e) => {
                         eprintln!("[core] upgrade_star_gift error: {e:?}");
@@ -3777,11 +3917,20 @@ impl Dispatcher {
         let mut w = Writer::new();
         w.write_u32(0x4e5f_810d); // payments.paymentResult#4e5f810d
         w.write_u32(0x74ae_4240); // updates#74ae4240
-        w.write_vector_header(1);
-        w.write_u32(0x4e80_a379); // updateStarsBalance#4e80a379
-        w.write_u32(0xbbb6_b4a3); // starsAmount#bbb6b4a3
-        w.write_i64(new_bal);
-        w.write_i32(0);
+        if let Some(ref upg) = upgraded_gift {
+            w.write_vector_header(2);
+            w.write_u32(0x4e80_a379); // updateStarsBalance#4e80a379
+            w.write_u32(0xbbb6_b4a3); // starsAmount#bbb6b4a3
+            w.write_i64(new_bal);
+            w.write_i32(0);
+            self.write_upgrade_update_message(&mut w, me.id, upg);
+        } else {
+            w.write_vector_header(1);
+            w.write_u32(0x4e80_a379); // updateStarsBalance#4e80a379
+            w.write_u32(0xbbb6_b4a3); // starsAmount#bbb6b4a3
+            w.write_i64(new_bal);
+            w.write_i32(0);
+        }
         w.write_vector_header(0);
         w.write_vector_header(0);
         w.write_i32(now_unix());
@@ -3795,7 +3944,7 @@ impl Dispatcher {
         let (_, upg) = self.store().acid().get_gift_prices(gift_id).unwrap_or((50, 25));
         let mut w = Writer::new();
         w.write_u32(0x3de1_dfed); // starGiftUpgradePreview#3de1dfed
-        w.write_vector_header(0); // sample_attributes
+        self.write_sample_attributes(&mut w, gift_id);
         w.write_vector_header(1); // prices
         w.write_u32(0x99ea_331d); // StarGiftUpgradePrice#99ea331d
         w.write_i32(now_unix());
@@ -3805,10 +3954,11 @@ impl Dispatcher {
     }
 
     // payments.getStarGiftUpgradeAttributes#6d038b58 gift_id:long = payments.StarGiftUpgradeAttributes;
-    pub fn payments_get_star_gift_upgrade_attributes(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    pub fn payments_get_star_gift_upgrade_attributes(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let gift_id = r.read_i64().unwrap_or(0);
         let mut w = Writer::new();
         w.write_u32(0x46c6_e36f); // starGiftUpgradeAttributes#46c6e36f
-        w.write_vector_header(0); // attributes
+        self.write_sample_attributes(&mut w, gift_id);
         w.into_vec()
     }
 
@@ -3828,7 +3978,7 @@ impl Dispatcher {
             let slug = g.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", g.instance_id));
             w.write_string(&slug);
             w.write_i32(g.serial_number.unwrap_or(1));
-            w.write_vector_header(0);
+            self.write_unique_gift_attributes(&mut w, g.gift_id);
             w.write_i32(1);
             w.write_i32(1000);
         } else {
@@ -3837,7 +3987,7 @@ impl Dispatcher {
             w.write_string("Collectible Gift");
             w.write_string(slug);
             w.write_i32(1);
-            w.write_vector_header(0);
+            self.write_unique_gift_attributes(&mut w, 5001);
             w.write_i32(1);
             w.write_i32(1000);
         }
@@ -3932,40 +4082,7 @@ impl Dispatcher {
         w.write_i64(bal);
         w.write_i32(0);
         // 2. updateNewMessage
-        w.write_u32(0x1f2b_0afd); // updateNewMessage#1f2b0afd
-        // messageService#2b085862
-        w.write_u32(0x2b08_5862);
-        let mflags = 1 << 8; // from_id
-        w.write_i32(mflags);
-        w.write_i32(upgraded.instance_id as i32); // id
-        // from_id: Peer
-        w.write_u32(TL_PEER_USER);
-        w.write_i64(me.id);
-        // peer_id: Peer
-        w.write_u32(TL_PEER_USER);
-        w.write_i64(me.id);
-        w.write_i32(now_unix()); // date
-        // action: messageActionStarGiftUnique#e6c31522
-        w.write_u32(0xe6c3_1522);
-        let aflags = 1 | (1 << 2); // upgrade:flags.0?true | saved:flags.2?true
-        w.write_i32(aflags);
-        // gift: StarGift (starGiftUnique#85f0a9cd)
-        w.write_u32(0x85f0_a9cd);
-        w.write_i32(0); // flags
-        w.write_i64(upgraded.instance_id);
-        w.write_i64(upgraded.gift_id);
-        let title = upgraded.collectible_slug.clone().unwrap_or_else(|| "Collectible Gift".to_string());
-        w.write_string(&title);
-        let slug = upgraded.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", upgraded.instance_id));
-        w.write_string(&slug);
-        w.write_i32(upgraded.serial_number.unwrap_or(1));
-        w.write_vector_header(0); // attributes
-        w.write_i32(1); // availability_issued
-        w.write_i32(1000); // availability_total
-        // updateNewMessage pts and pts_count
-        w.write_i32(1); // pts
-        w.write_i32(1); // pts_count
-
+        self.write_upgrade_update_message(&mut w, me.id, &upgraded);
         w.write_vector_header(0); // users
         w.write_vector_header(0); // chats
         w.write_i32(now_unix());  // date

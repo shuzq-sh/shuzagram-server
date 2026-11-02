@@ -3035,10 +3035,12 @@ mod tests {
         let mut r = Reader::new(&res);
         assert_eq!(r.read_u32().unwrap(), 0x4e5f_810d); // payments.paymentResult
         assert_eq!(r.read_u32().unwrap(), 0x74ae_4240); // updates
-        assert_eq!(r.read_vector_header().unwrap(), 1); // 1 update
+        assert_eq!(r.read_vector_header().unwrap(), 2); // 2 updates: updateStarsBalance + updateNewMessage
         assert_eq!(r.read_u32().unwrap(), 0x4e80_a379); // updateStarsBalance
         assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
         assert_eq!(r.read_i64().unwrap(), 425); // 450 - 25 upgrade fee
+        assert_eq!(r.read_i32().unwrap(), 0); // nanos
+        assert_eq!(r.read_u32().unwrap(), 0x1f2b_0afd); // updateNewMessage
 
         // 5e. payments.getUniqueStarGift for upgraded gift
         let mut q = Writer::new();
