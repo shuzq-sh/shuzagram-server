@@ -823,7 +823,10 @@ impl Dispatcher {
             0x2e6e_ab1a => self.payments_get_stars_subscriptions(ctx, r),
             0x3714_8dbb => self.payments_get_payment_form(ctx, r),
             0x7998_c914 | 0x2737_6c5b => self.payments_send_stars_form(ctx, r),
-            0x3ea2_05e2 => self.payments_save_star_gift(ctx, r),
+            0x3ea2_05e2 | 0x8265_3886 => self.payments_save_star_gift(ctx, r),
+            0x9c9a_bcb1 => self.payments_get_star_gift_upgrade_preview(ctx, r),
+            0x6d03_8b58 => self.payments_get_star_gift_upgrade_attributes(ctx, r),
+            0xa197_4d72 => self.payments_get_unique_star_gift(ctx, r),
 
             STORIES_GET_ALL_STORIES => stories_all_stories_not_modified(),
             STORIES_GET_PEER_STORIES => self.stories_peer_stories_empty(ctx, r),
@@ -2951,7 +2954,7 @@ mod tests {
         q.write_i64(5001); // Crystal Star (50 stars)
         let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 203, &q.into_vec())[0]);
         let mut r = Reader::new(&res);
-        assert_eq!(r.read_u32().unwrap(), 0x4e71_ea61); // payments.paymentResult
+        assert_eq!(r.read_u32().unwrap(), 0x4e5f_810d); // payments.paymentResult#4e5f810d
 
         // 4. Verify Stars balance decreased to 450
         let mut q = Writer::new();
@@ -2977,6 +2980,60 @@ mod tests {
         assert_eq!(r.read_i32().unwrap(), 0);
         let count = r.read_i32().unwrap();
         assert_eq!(count, 1);
+
+        // 5b. payments.getPaymentForm for star gift purchase
+        let mut q = Writer::new();
+        q.write_u32(0x3714_8dbb); // payments.getPaymentForm
+        q.write_i32(0); // flags
+        q.write_u32(0xe862_5e92); // inputInvoiceStarGift
+        q.write_i32(0); // flags
+        q.write_u32(INPUT_PEER_SELF);
+        q.write_i64(5001); // Crystal Star
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 207, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0xb425_cfe1); // paymentFormStarGift
+        let _form_id = r.read_i64().unwrap();
+        assert_eq!(r.read_u32().unwrap(), 0x049e_e584); // invoice#049ee584
+        assert_eq!(r.read_i32().unwrap(), 0); // flags
+        assert_eq!(r.read_string().unwrap(), "XTR");
+        assert_eq!(r.read_vector_header().unwrap(), 1);
+        assert_eq!(r.read_u32().unwrap(), 0xcb29_6bf8); // labeledPrice
+        let _ = r.read_string().unwrap();
+        assert_eq!(r.read_i64().unwrap(), 50);
+
+        // 5c. payments.getStarGiftUpgradePreview
+        let mut q = Writer::new();
+        q.write_u32(0x9c9a_bcb1); // payments.getStarGiftUpgradePreview
+        q.write_i64(5001);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 208, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x3de1_dfed); // starGiftUpgradePreview
+
+        // 5d. Upgrade the purchased gift (instance_id = 1) via payments.sendStarsForm
+        let mut q = Writer::new();
+        q.write_u32(0x7998_c914); // payments.sendStarsForm
+        q.write_i64(12346); // form_id
+        q.write_u32(0x4d81_8d5d); // inputInvoiceStarGiftUpgrade
+        q.write_i32(0); // flags
+        q.write_u32(0x6927_9795); // inputSavedStarGiftUser
+        q.write_i32(1); // msg_id (instance_id = 1)
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 209, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x4e5f_810d); // payments.paymentResult
+        assert_eq!(r.read_u32().unwrap(), 0x74ae_4240); // updates
+        assert_eq!(r.read_vector_header().unwrap(), 1); // 1 update
+        assert_eq!(r.read_u32().unwrap(), 0x4e80_a379); // updateStarsBalance
+        assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
+        assert_eq!(r.read_i64().unwrap(), 425); // 450 - 25 upgrade fee
+
+        // 5e. payments.getUniqueStarGift for upgraded gift
+        let mut q = Writer::new();
+        q.write_u32(0xa197_4d72); // payments.getUniqueStarGift
+        q.write_string("CrystalStar-1");
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 210, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x416c_56e8); // payments.uniqueStarGift
+        assert_eq!(r.read_u32().unwrap(), 0x85f0_a9cd); // starGiftUnique
 
         // 6. help.getAppConfig must contain stargifts_blocked=false, stars_purchase_blocked=false, premium_purchase_blocked=false
         let mut q = Writer::new();

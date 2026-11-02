@@ -3078,6 +3078,82 @@ impl AcidStore {
         .collect()
     }
 
+    pub fn get_gift_prices(&self, gift_id: i64) -> Option<(i64, i64)> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT star_price_units, upgrade_price_units FROM gifts_catalog WHERE gift_id = ?1",
+            params![gift_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn get_user_gift_upgrade_price(&self, instance_id: i64) -> Option<i64> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT c.upgrade_price_units FROM user_gifts g JOIN gifts_catalog c ON g.gift_id = c.gift_id WHERE g.instance_id = ?1",
+            params![instance_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn get_unique_gift_by_slug(&self, slug: &str) -> Option<UserGiftRow> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
+                    collectible_slug, is_upgraded, message, minted_at
+             FROM user_gifts WHERE collectible_slug = ?1",
+            params![slug],
+            |r| {
+                Ok(UserGiftRow {
+                    instance_id: r.get(0)?,
+                    gift_id: r.get(1)?,
+                    owner_user_id: r.get(2)?,
+                    sender_user_id: r.get(3)?,
+                    serial_number: r.get(4)?,
+                    collectible_slug: r.get(5)?,
+                    is_upgraded: r.get::<_, i32>(6)? != 0,
+                    message: r.get(7)?,
+                    minted_at: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn get_user_gift_by_id(&self, instance_id: i64) -> Option<UserGiftRow> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
+                    collectible_slug, is_upgraded, message, minted_at
+             FROM user_gifts WHERE instance_id = ?1",
+            params![instance_id],
+            |r| {
+                Ok(UserGiftRow {
+                    instance_id: r.get(0)?,
+                    gift_id: r.get(1)?,
+                    owner_user_id: r.get(2)?,
+                    sender_user_id: r.get(3)?,
+                    serial_number: r.get(4)?,
+                    collectible_slug: r.get(5)?,
+                    is_upgraded: r.get::<_, i32>(6)? != 0,
+                    message: r.get(7)?,
+                    minted_at: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn issue_virtual_number(
         &self,
         phone_digits: &str,
