@@ -254,4 +254,36 @@ fn main() {
     );
     assert_eq!(r.remaining(), 0);
     println!("payments.getStarGiftCollections checks PASSED!");
+
+    // 4. auth.exportAuthorization and auth.importAuthorization (cross-DC download handshake)
+    println!("--- checking auth.exportAuthorization / importAuthorization ---");
+    let mut q = Writer::new();
+    q.write_u32(0xe5bf_ffcd); // auth.exportAuthorization
+    q.write_i32(2); // dc_id
+    let (_i, reply) = c.invoke(&wrap(&q.into_vec())).unwrap();
+    let mut r = Reader::new(&reply);
+    let ctor = r.read_u32().unwrap();
+    if ctor == 0xf35c_6d01 {
+        let _ = r.read_i64();
+    }
+    let res = r.read_u32().unwrap();
+    assert_eq!(res, 0xb434_e2b8, "want auth.exportedAuthorization#b434e2b8, got {res:#x}");
+    let exp_uid = r.read_i64().unwrap();
+    let ticket = r.read_bytes().unwrap().to_vec();
+    assert_eq!(r.remaining(), 0);
+    println!("exportedAuthorization ok: uid={exp_uid}, ticket len={}", ticket.len());
+
+    let mut q = Writer::new();
+    q.write_u32(0xa57a_7dad); // auth.importAuthorization
+    q.write_i64(exp_uid);
+    q.write_bytes(&ticket);
+    let (_i, reply) = c.invoke(&wrap(&q.into_vec())).unwrap();
+    let mut r = Reader::new(&reply);
+    let ctor = r.read_u32().unwrap();
+    if ctor == 0xf35c_6d01 {
+        let _ = r.read_i64();
+    }
+    let res = r.read_u32().unwrap();
+    assert_eq!(res, 0x2ea2_c0d4, "want auth.authorization#2ea2c0d4, got {res:#x}");
+    println!("importAuthorization ok: auth.authorization received!");
 }

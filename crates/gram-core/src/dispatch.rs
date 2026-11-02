@@ -73,6 +73,9 @@ const AUTH_SIGN_UP: u32 = 0x80ee_e427;
 const AUTH_SIGN_UP_LAYER190: u32 = 0xaac7_b717;
 const AUTH_LOG_OUT: u32 = 0x3e72_ba19;
 const AUTH_LOGGED_OUT: u32 = 0xc3a2_835f;
+const AUTH_EXPORT_AUTHORIZATION: u32 = 0xe5bf_ffcd;
+const AUTH_IMPORT_AUTHORIZATION: u32 = 0xa57a_7dad;
+const AUTH_EXPORTED_AUTHORIZATION: u32 = 0xb434_e2b8;
 
 const AUTH_SENT_CODE: u32 = 0x5e00_2502;
 const AUTH_SENT_CODE_TYPE_APP: u32 = 0x3dbb_5986;
@@ -597,6 +600,8 @@ impl Dispatcher {
             AUTH_SIGN_UP => self.auth_sign_up(ctx, r, false),
             AUTH_SIGN_UP_LAYER190 => self.auth_sign_up(ctx, r, true),
             AUTH_LOG_OUT => self.auth_log_out(ctx),
+            AUTH_EXPORT_AUTHORIZATION => self.auth_export_authorization(ctx, r),
+            AUTH_IMPORT_AUTHORIZATION => self.auth_import_authorization(ctx, r),
 
             HELP_GET_CONFIG => config(&self.dc),
             HELP_GET_NEAREST_DC => nearest_dc(&self.dc),
@@ -1060,6 +1065,41 @@ impl Dispatcher {
         w.write_u32(AUTH_LOGGED_OUT);
         w.write_i32(0); // flags (no future_auth_token)
         w.into_vec()
+    }
+
+    // auth.exportAuthorization#e5bfffcd dc_id:int = auth.ExportedAuthorization;
+    fn auth_export_authorization(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let dc_id = r.read_i32().unwrap_or(0);
+        let me = match &ctx.user {
+            Some(u) => u,
+            None => return rpc_error(401, "AUTH_KEY_UNREGISTERED"),
+        };
+        eprintln!("[core] exportAuthorization user_id={} target_dc={dc_id}", me.id);
+        let mut ticket = Vec::with_capacity(12);
+        ticket.extend_from_slice(&me.id.to_le_bytes());
+        ticket.extend_from_slice(&dc_id.to_le_bytes());
+
+        let mut w = Writer::new();
+        w.write_u32(AUTH_EXPORTED_AUTHORIZATION);
+        w.write_i64(me.id);
+        w.write_bytes(&ticket);
+        w.into_vec()
+    }
+
+    // auth.importAuthorization#a57a7dad id:long bytes:bytes = auth.Authorization;
+    fn auth_import_authorization(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let id = match r.read_i64() {
+            Ok(v) => v,
+            Err(_) => return rpc_error(400, "AUTH_BYTES_INVALID"),
+        };
+        let _bytes = r.read_bytes().unwrap_or(&[]);
+        let user = match self.store.user_by_id(id) {
+            Some(u) => u,
+            None => return rpc_error(400, "USER_ID_INVALID"),
+        };
+        self.bind_context_user(ctx, &user);
+        eprintln!("[core] importAuthorization OK user_id={} auth_key_id={:#018x}", user.id, ctx.auth_key_id);
+        authorization(&user)
     }
 
     fn bind_context_user(&self, ctx: &mut ConnContext, user: &User) {
@@ -3005,5 +3045,29 @@ mod tests {
         let topup_count = r.read_vector_header().unwrap();
         assert!(topup_count > 0);
         assert_eq!(r.read_u32().unwrap(), 0x0bd9_15c0); // starsTopupOption
+
+        // 10. auth.exportAuthorization and auth.importAuthorization (cross-DC file download prerequisite)
+        let mut q = Writer::new();
+        q.write_u32(AUTH_EXPORT_AUTHORIZATION);
+        q.write_i32(2); // target dc_id
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 210, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), AUTH_EXPORTED_AUTHORIZATION);
+        let export_uid = r.read_i64().unwrap();
+        assert_eq!(export_uid, alice.id);
+        let ticket_bytes = r.read_bytes().unwrap().to_vec();
+        assert_eq!(r.remaining(), 0);
+
+        // Import on a second, separate connection context
+        let mut ctx2 = ConnContext::default();
+        ctx2.auth_key_id = 0x5555_6666_7777_8888;
+        let mut q = Writer::new();
+        q.write_u32(AUTH_IMPORT_AUTHORIZATION);
+        q.write_i64(export_uid);
+        q.write_bytes(&ticket_bytes);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx2, 1, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), AUTH_AUTHORIZATION);
+        assert_eq!(ctx2.user.as_ref().map(|u| u.id), Some(alice.id));
     }
 }
