@@ -150,8 +150,9 @@ impl Dispatcher {
         let _ = r.read_i32();
         let _ = r.read_string();
 
-        let (hash, code) = self.store.start_login(phone);
-        eprintln!("[core] sendCode phone={phone} -> code={code} (dev)");
+        let (hash, _code) = self.store.start_login(phone);
+        // Never log the code (test-server master code must stay private).
+        eprintln!("[core] sendCode phone={phone}");
 
         // auth.sentCode flags:# type:auth.SentCodeType phone_code_hash:string
         let mut w = Writer::new();

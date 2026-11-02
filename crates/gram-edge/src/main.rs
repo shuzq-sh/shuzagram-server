@@ -14,7 +14,15 @@ fn main() {
     eprintln!("[edge] generating server RSA-2048 key…");
     let rsa = Arc::new(ServerRsaKey::generate());
     let dh = dh::server_default();
-    let dispatcher = Arc::new(Dispatcher::new(Arc::new(Store::new())));
+
+    // Test-server master code: read from the environment only, never hardcoded.
+    // When set, any phone number registers with this code.
+    let test_code = std::env::var("SHUZA_TEST_CODE").ok().filter(|s| !s.is_empty());
+    let store = Arc::new(Store::with_test_code(test_code));
+    if store.is_test_server() {
+        eprintln!("[edge] TEST SERVER mode: any number registers with the configured test code");
+    }
+    let dispatcher = Arc::new(Dispatcher::new(store));
     eprintln!(
         "[edge] rsa fingerprint = {:#018x}  (configure the client with this key)",
         rsa.fingerprint

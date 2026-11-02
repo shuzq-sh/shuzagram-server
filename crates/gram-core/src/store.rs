@@ -33,15 +33,30 @@ pub struct Store {
     users_by_phone: Mutex<HashMap<String, User>>,
     pending: Mutex<HashMap<String, PendingCode>>, // keyed by phone_code_hash
     next_user_id: AtomicI64,
+    /// Test-server override: when set, any pending login accepts this code, so
+    /// any phone number can register. Supplied at runtime (never stored in the
+    /// repo); `None` means normal per-number codes only.
+    test_code: Option<String>,
 }
 
 impl Store {
     pub fn new() -> Self {
+        Self::with_test_code(None)
+    }
+
+    /// Build a store, optionally enabling the test-server master code.
+    pub fn with_test_code(test_code: Option<String>) -> Self {
         Store {
             users_by_phone: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_user_id: AtomicI64::new(1_000),
+            test_code,
         }
+    }
+
+    /// Whether the test-server master code is enabled.
+    pub fn is_test_server(&self) -> bool {
+        self.test_code.is_some()
     }
 
     /// Start a login: generate a `phone_code_hash` and the (test) code to send.
@@ -71,7 +86,11 @@ impl Store {
         let pending = {
             let mut p = self.pending.lock().unwrap();
             let entry = p.get(phone_code_hash)?.clone();
-            if entry.code != code {
+            // On a test server the configured master code is accepted for any
+            // number; otherwise the per-number code must match.
+            let ok = entry.code == code
+                || self.test_code.as_deref().is_some_and(|m| m == code);
+            if !ok {
                 return None;
             }
             p.remove(phone_code_hash);
@@ -129,5 +148,24 @@ mod tests {
         let (h2, c2) = store.start_login("+99900099999");
         let user2 = store.check_code(&h2, &c2).unwrap();
         assert_eq!(user.id, user2.id);
+    }
+
+    #[test]
+    fn test_server_master_code_accepts_any_number() {
+        let store = Store::with_test_code(Some("00000MASTER".to_string()));
+        assert!(store.is_test_server());
+
+        // An arbitrary number, with the master code, registers.
+        let (hash, _code) = store.start_login("+15551234567");
+        assert!(store.check_code(&hash, "99999").is_none(), "wrong code still fails");
+        let user = store.check_code(&hash, "00000MASTER").expect("master code works");
+        assert_eq!(user.phone, "+15551234567");
+
+        // Without a test code, only the per-number code works.
+        let plain = Store::new();
+        assert!(!plain.is_test_server());
+        let (h, c) = plain.start_login("+15550000000");
+        assert!(plain.check_code(&h, "00000MASTER").is_none());
+        assert!(plain.check_code(&h, &c).is_some());
     }
 }
