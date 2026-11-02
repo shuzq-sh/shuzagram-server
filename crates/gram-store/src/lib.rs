@@ -578,6 +578,14 @@ impl AcidStore {
                 detail_json     TEXT NOT NULL DEFAULT '{}',
                 created_at      INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS message_views (
+                peer_kind       INTEGER NOT NULL,
+                peer_id         INTEGER NOT NULL,
+                msg_id          INTEGER NOT NULL,
+                views           INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (peer_kind, peer_id, msg_id)
+            );
             ",
         )?;
 
@@ -2227,6 +2235,65 @@ impl AcidStore {
         tx.commit()?;
         drop(db);
         Ok(self.channel_by_id(channel_id).unwrap_or(chan))
+    }
+
+    pub fn get_channel_members(
+        &self,
+        channel_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<(i64, bool, i32)> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = match db.prepare(
+            "SELECT user_id, is_admin, joined_at
+             FROM channel_members
+             WHERE channel_id = ?1
+             ORDER BY is_admin DESC, joined_at ASC
+             LIMIT ?2 OFFSET ?3",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map(params![channel_id, limit as i64, offset as i64], |r| {
+                Ok((r.get(0)?, r.get::<_, i32>(1)? != 0, r.get(2)?))
+            })
+            .ok();
+        rows.into_iter().flatten().filter_map(Result::ok).collect()
+    }
+
+    pub fn get_or_inc_message_views(
+        &self,
+        peer_kind: i32,
+        peer_id: i64,
+        msg_ids: &[i32],
+        increment: bool,
+    ) -> Vec<i32> {
+        let db = self.conn.lock().unwrap();
+        let mut out = Vec::with_capacity(msg_ids.len());
+        for &mid in msg_ids {
+            let v = if increment {
+                db.query_row(
+                    "INSERT INTO message_views (peer_kind, peer_id, msg_id, views)
+                     VALUES (?1, ?2, ?3, 1)
+                     ON CONFLICT (peer_kind, peer_id, msg_id)
+                     DO UPDATE SET views = views + 1
+                     RETURNING views",
+                    params![peer_kind, peer_id, mid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1)
+            } else {
+                db.query_row(
+                    "SELECT views FROM message_views WHERE peer_kind = ?1 AND peer_id = ?2 AND msg_id = ?3",
+                    params![peer_kind, peer_id, mid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1)
+            };
+            out.push(v);
+        }
+        out
     }
 
     pub fn send_channel_message(

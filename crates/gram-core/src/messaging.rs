@@ -102,6 +102,27 @@ pub const TL_INPUT_REPLY_TO_MONOFORUM: u32 = 0x69d6_6c45;
 pub const TL_CHANNEL_MESSAGES_FILTER_EMPTY: u32 = 0x94d4_2ee7;
 pub const TL_CHANNEL_MESSAGES_FILTER: u32 = 0xcd77_d957;
 
+pub const TL_BOOL_TRUE: u32 = 0x9972_75b5;
+pub const TL_MESSAGES_MESSAGE_VIEWS: u32 = 0xb6c4_f543;
+pub const TL_MESSAGE_VIEWS: u32 = 0x455b_853d;
+pub const TL_CHANNELS_CHANNEL_PARTICIPANTS: u32 = 0x9ab0_feaf;
+pub const TL_CHANNEL_PARTICIPANT_CREATOR: u32 = 0x2fe6_01d3;
+pub const TL_CHANNEL_PARTICIPANT: u32 = 0x1bd5_4456;
+pub const TL_CHAT_ADMIN_RIGHTS: u32 = 0x5fb2_24d5;
+pub const TL_MESSAGES_PEER_SETTINGS: u32 = 0x6880_b94d;
+pub const TL_PEER_SETTINGS: u32 = 0xf477_41f7;
+pub const TL_MESSAGES_SAVED_DIALOGS: u32 = 0xf83a_e221;
+pub const TL_PREMIUM_BOOSTS_STATUS: u32 = 0x4959_427a;
+pub const TL_MESSAGES_SPONSORED_MESSAGES_EMPTY: u32 = 0x1839_490f;
+pub const TL_EMOJI_KEYWORDS_DIFFERENCE: u32 = 0x5cc7_61bd;
+pub const TL_MESSAGES_AVAILABLE_EFFECTS: u32 = 0xbddb_616e;
+pub const TL_REQUIREMENT_TO_CONTACT_EMPTY: u32 = 0x050a_9839;
+pub const TL_PAYMENTS_STAR_GIFT_COLLECTIONS: u32 = 0x8a29_32f3;
+pub const TL_STORIES_ALBUMS: u32 = 0xc398_7a3a;
+pub const TL_MESSAGES_SAVED_REACTION_TAGS: u32 = 0x3259_950a;
+pub const TL_MESSAGES_EXPORTED_CHAT_INVITES: u32 = 0xbdc6_2dcc;
+pub const TL_CONTACTS_SPONSORED_PEERS_EMPTY: u32 = 0xea32_b4b1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedPeer {
     User(i64),
@@ -2050,6 +2071,10 @@ impl Dispatcher {
         let Ok(Some(cid)) = parse_input_channel(r, Some(viewer_id)) else {
             return rpc_error(400, "CHANNEL_INVALID");
         };
+        self.channels_get_full_channel_by_id(cid, viewer_id)
+    }
+
+    pub fn channels_get_full_channel_by_id(&self, cid: i64, viewer_id: i64) -> Vec<u8> {
         let Some(chan) = self.store().acid().channel_by_id(cid) else {
             return rpc_error(400, "CHANNEL_INVALID");
         };
@@ -2344,6 +2369,299 @@ impl Dispatcher {
             }
         }
         out
+    }
+
+    pub fn messages_get_messages_views(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let peer = parse_input_peer(r, Some(me.id)).ok().flatten().unwrap_or(ParsedPeer::User(me.id));
+        let ids = read_message_id_list(r, false);
+        let increment = r.read_bool().unwrap_or(false);
+
+        let (peer_kind, peer_id) = peer.kind_and_id();
+        let view_counts = self.store().acid().get_or_inc_message_views(peer_kind, peer_id, &ids, increment);
+
+        let mut views_tl = Vec::with_capacity(view_counts.len());
+        for cnt in view_counts {
+            let mut vw = Writer::new();
+            vw.write_u32(TL_MESSAGE_VIEWS);
+            vw.write_i32(1); // FLAG_0: views present
+            vw.write_i32(cnt);
+            views_tl.push(vw.into_vec());
+        }
+
+        let mut chats_tl = Vec::new();
+        if peer_kind == KIND_CHANNEL {
+            if let Some(c) = self.store().acid().channel_by_id(peer_id) {
+                chats_tl.push(encode_tl_channel(&c, me.id));
+            }
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_MESSAGE_VIEWS);
+        w.write_vector_header(views_tl.len());
+        for v in &views_tl {
+            w.write_raw(v);
+        }
+        w.write_vector_header(chats_tl.len());
+        for c in &chats_tl {
+            w.write_raw(c);
+        }
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    pub fn messages_report_read_metrics(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    pub fn channels_get_participants(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Some(chan) = self.store().acid().channel_by_id(cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let _filter_ctor = r.read_u32();
+        let offset = r.read_i32().unwrap_or(0).max(0) as usize;
+        let limit = r.read_i32().unwrap_or(50).clamp(1, 200) as usize;
+        let _hash = r.read_i64();
+
+        let members = self.store().acid().get_channel_members(cid, offset, limit);
+        let mut user_ids = BTreeSet::new();
+        let mut parts_tl = Vec::with_capacity(members.len());
+
+        for (uid, is_admin, joined_at) in &members {
+            user_ids.insert(*uid);
+            let mut pw = Writer::new();
+            if *uid == chan.creator_id || *is_admin {
+                pw.write_u32(TL_CHANNEL_PARTICIPANT_CREATOR);
+                pw.write_i32(0); // flags
+                pw.write_i64(*uid);
+                pw.write_u32(TL_CHAT_ADMIN_RIGHTS);
+                pw.write_i32(0x7ffff); // full admin rights
+            } else {
+                pw.write_u32(TL_CHANNEL_PARTICIPANT);
+                pw.write_i32(0); // flags
+                pw.write_i64(*uid);
+                pw.write_i32(*joined_at);
+            }
+            parts_tl.push(pw.into_vec());
+        }
+
+        let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+        let total_count = chan.participants_count.max(parts_tl.len() as i32);
+
+        let mut w = Writer::new();
+        w.write_u32(TL_CHANNELS_CHANNEL_PARTICIPANTS);
+        w.write_i32(total_count);
+        w.write_vector_header(parts_tl.len());
+        for p in &parts_tl {
+            w.write_raw(p);
+        }
+        w.write_vector_header(1); // chats
+        w.write_raw(&encode_tl_channel(&chan, me.id));
+        w.write_vector_header(users_tl.len());
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.into_vec()
+    }
+
+    pub fn messages_get_full_chat(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let chat_id = r.read_i64().unwrap_or(0);
+        if self.store().acid().channel_by_id(chat_id).is_some() {
+            return self.channels_get_full_channel_by_id(chat_id, me.id);
+        }
+        if let Some(chat) = self.store().acid().chat_by_id(chat_id) {
+            let mut w = Writer::new();
+            w.write_u32(TL_MESSAGES_CHAT_FULL);
+            w.write_u32(0x2633_421b); // chatFull#2633421b
+            w.write_i32(0); // flags
+            w.write_i64(chat.chat_id);
+            w.write_string(""); // about
+            w.write_u32(0x3c40_7ac0); // chatParticipants#3c407ac0
+            w.write_i64(chat.chat_id);
+            w.write_vector_header(0); // participants
+            w.write_i32(chat.version);
+            w.write_u32(TL_PEER_NOTIFY_SETTINGS);
+            w.write_i32(0);
+            w.write_vector_header(1);
+            w.write_raw(&encode_tl_chat(&chat, me.id));
+            w.write_vector_header(0);
+            return w.into_vec();
+        }
+        rpc_error(400, "CHAT_ID_INVALID")
+    }
+
+    pub fn messages_get_peer_settings(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = self.require_auth_user(ctx).ok();
+        let _ = parse_input_peer(r, me.as_ref().map(|u| u.id));
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_PEER_SETTINGS);
+        w.write_u32(TL_PEER_SETTINGS);
+        w.write_i32(0);
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    pub fn messages_get_saved_dialogs(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_SAVED_DIALOGS);
+        for _ in 0..4 {
+            w.write_vector_header(0);
+        }
+        w.into_vec()
+    }
+
+    pub fn premium_get_boosts_status(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_PREMIUM_BOOSTS_STATUS);
+        w.write_i32(0); // flags
+        w.write_i32(0); // level
+        w.write_i32(0); // current_level_boosts
+        w.write_i32(0); // boosts
+        w.write_string(""); // boost_url
+        w.into_vec()
+    }
+
+    pub fn messages_get_sponsored_messages(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_SPONSORED_MESSAGES_EMPTY);
+        w.into_vec()
+    }
+
+    pub fn messages_get_emoji_keywords(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let lang = r.read_string().unwrap_or_default();
+        let mut w = Writer::new();
+        w.write_u32(TL_EMOJI_KEYWORDS_DIFFERENCE);
+        w.write_string(lang);
+        w.write_i32(0); // from_version
+        w.write_i32(0); // version
+        w.write_vector_header(0); // keywords
+        w.into_vec()
+    }
+
+    pub fn messages_get_available_effects(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_AVAILABLE_EFFECTS);
+        w.write_i32(0); // hash
+        w.write_vector_header(0); // effects
+        w.write_vector_header(0); // documents
+        w.into_vec()
+    }
+
+    pub fn users_get_requirements_to_contact(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let count = r.read_vector_header().unwrap_or(0).min(100) as usize;
+        let mut w = Writer::new();
+        w.write_vector_header(count);
+        for _ in 0..count {
+            w.write_u32(TL_REQUIREMENT_TO_CONTACT_EMPTY);
+        }
+        w.into_vec()
+    }
+
+    pub fn messages_get_messages_reactions(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn channels_get_channel_recommendations(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_CHATS);
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    pub fn payments_get_star_gift_collections(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_PAYMENTS_STAR_GIFT_COLLECTIONS);
+        w.write_i32(0); // count
+        w.write_vector_header(0); // collections
+        w.into_vec()
+    }
+
+    pub fn stories_get_albums(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_STORIES_ALBUMS);
+        w.write_i64(0); // hash
+        w.write_vector_header(0); // albums
+        w.into_vec()
+    }
+
+    pub fn stories_get_peer_max_ids(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let count = r.read_vector_header().unwrap_or(0).min(100) as usize;
+        let mut w = Writer::new();
+        w.write_vector_header(count);
+        for _ in 0..count {
+            w.write_i32(0);
+        }
+        w.into_vec()
+    }
+
+    pub fn stories_get_all_read_peer_stories(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_get_all_drafts(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_get_saved_reaction_tags(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_SAVED_REACTION_TAGS);
+        w.write_vector_header(0); // tags
+        w.write_i64(0); // hash
+        w.into_vec()
+    }
+
+    pub fn messages_get_exported_chat_invites(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_EXPORTED_CHAT_INVITES);
+        w.write_i32(0); // count
+        w.write_vector_header(0); // invites
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    pub fn channels_get_groups_for_discussion(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_CHATS);
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    pub fn channels_set_discussion_group(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    pub fn messages_search(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_MESSAGES);
+        for _ in 0..3 {
+            w.write_vector_header(0);
+        }
+        w.into_vec()
+    }
+
+    pub fn contacts_get_sponsored_peers(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_CONTACTS_SPONSORED_PEERS_EMPTY);
+        w.into_vec()
     }
 }
 
