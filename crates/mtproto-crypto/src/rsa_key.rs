@@ -53,10 +53,10 @@ impl ServerRsaKey {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let mut rng = rand::thread_rng();
                 let key = RsaPrivateKey::new(&mut rng, 2048)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let pem = key
                     .to_pkcs1_pem(LineEnding::LF)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 std::fs::write(path, pem.as_bytes())?;
                 #[cfg(unix)]
                 {
