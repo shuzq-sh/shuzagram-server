@@ -257,13 +257,47 @@ fn main() {
 
     // 4. auth.exportAuthorization and auth.importAuthorization (cross-DC download handshake)
     println!("--- checking auth.exportAuthorization / importAuthorization ---");
+    let test_phone = "+9990001002";
+    let test_code = std::env::var("SHUZA_TEST_CODE").unwrap_or_else(|_| "82974".to_string());
+    // 1. sendCode
+    let mut sc = Writer::new();
+    sc.write_u32(0xa677_244f); // auth.sendCode
+    sc.write_string(test_phone);
+    sc.write_i32(12345);
+    sc.write_string("apihash");
+    let (_i, reply) = c.invoke(&wrap(&sc.into_vec())).unwrap();
+    let mut r = Reader::new(&reply);
+    if r.read_u32().unwrap() == 0xf35c_6d01 {
+        let _ = r.read_i64();
+    }
+    let _ = r.read_u32(); // auth.sentCode
+    let _ = r.read_i32(); // flags
+    let _ = r.read_u32(); // type
+    let _ = r.read_i32(); // timeout
+    let hash = r.read_string().unwrap().to_string();
+
+    // 2. signIn
+    let mut si = Writer::new();
+    si.write_u32(0x8d52_a951); // auth.signIn
+    si.write_i32(1); // flags
+    si.write_string(test_phone);
+    si.write_string(&hash);
+    si.write_string(&test_code);
+    let (_i, reply) = c.invoke(&wrap(&si.into_vec())).unwrap();
+    let mut r = Reader::new(&reply);
+    if r.read_u32().unwrap() == 0xf35c_6d01 {
+        let _ = r.read_i64();
+    }
+    let ctor = r.read_u32().unwrap();
+    assert_eq!(ctor, 0x2ea2_c0d4, "want auth.authorization, got {ctor:#x}");
+    println!("logged in successfully!");
+
     let mut q = Writer::new();
     q.write_u32(0xe5bf_ffcd); // auth.exportAuthorization
     q.write_i32(2); // dc_id
     let (_i, reply) = c.invoke(&wrap(&q.into_vec())).unwrap();
     let mut r = Reader::new(&reply);
-    let ctor = r.read_u32().unwrap();
-    if ctor == 0xf35c_6d01 {
+    if r.read_u32().unwrap() == 0xf35c_6d01 {
         let _ = r.read_i64();
     }
     let res = r.read_u32().unwrap();
@@ -279,8 +313,7 @@ fn main() {
     q.write_bytes(&ticket);
     let (_i, reply) = c.invoke(&wrap(&q.into_vec())).unwrap();
     let mut r = Reader::new(&reply);
-    let ctor = r.read_u32().unwrap();
-    if ctor == 0xf35c_6d01 {
+    if r.read_u32().unwrap() == 0xf35c_6d01 {
         let _ = r.read_i64();
     }
     let res = r.read_u32().unwrap();
