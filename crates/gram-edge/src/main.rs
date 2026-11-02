@@ -3,6 +3,7 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use gram_core::dispatch::DcEndpoint;
 use gram_core::{Dispatcher, Store};
 use gram_edge::transport;
 use mtproto_crypto::dh;
@@ -44,7 +45,15 @@ fn main() {
     if store.is_test_server() {
         eprintln!("[edge] TEST SERVER mode: any number registers with the configured test code");
     }
-    let dispatcher = Arc::new(Dispatcher::new(store));
+    // Address advertised to clients in help.getConfig. Defaults match the
+    // listener; override with SHUZA_DC_IP / SHUZA_DC_PORT / SHUZA_DC_ID.
+    let dc = DcEndpoint {
+        dc_id: std::env::var("SHUZA_DC_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+        ip: std::env::var("SHUZA_DC_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("SHUZA_DC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8443),
+    };
+    eprintln!("[edge] advertising dc{} at {}:{}", dc.dc_id, dc.ip, dc.port);
+    let dispatcher = Arc::new(Dispatcher::new(store).with_dc(dc));
     eprintln!(
         "[edge] rsa fingerprint = {:#018x}  (configure the client with this key)",
         rsa.fingerprint
