@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use gram_core::dispatch::DcEndpoint;
 use gram_core::{Dispatcher, SessionHub, Store};
+use gram_edge::admin::serve_admin_listener;
 use gram_edge::async_edge::{serve_tcp_listener, serve_ws_listener, EdgeConfig};
+use gram_edge::botapi::serve_botapi_listener;
 use gram_edge::keystore::KeyStore;
 use mtproto_crypto::dh;
 use mtproto_crypto::faketls::FakeTlsSecret;
@@ -97,7 +99,7 @@ async fn main() {
         });
 
     let dispatcher = Arc::new(
-        Dispatcher::new(store)
+        Dispatcher::new(Arc::clone(&store))
             .with_keys(Arc::clone(&keys))
             .with_hub(Arc::clone(&hub))
             .with_dc(dc),
@@ -115,6 +117,36 @@ async fn main() {
         fake_tls,
         enforce_clock_window: false,
     };
+
+    let botapi_addr = std::env::var("BOTAPI_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    match TcpListener::bind(&botapi_addr).await {
+        Ok(botapi_listener) => {
+            eprintln!("[edge] listening HTTP Bot API on http://{botapi_addr}");
+            let s = Arc::clone(&store);
+            let h = Arc::clone(&hub);
+            tokio::spawn(async move {
+                if let Err(e) = serve_botapi_listener(botapi_listener, s, h).await {
+                    eprintln!("[edge] botapi listener error: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("[edge] cannot bind Bot API {botapi_addr}: {e}"),
+    }
+
+    let admin_addr = std::env::var("ADMIN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    match TcpListener::bind(&admin_addr).await {
+        Ok(admin_listener) => {
+            eprintln!("[edge] listening Admin Control Plane on http://{admin_addr}");
+            let s = Arc::clone(&store);
+            let h = Arc::clone(&hub);
+            tokio::spawn(async move {
+                if let Err(e) = serve_admin_listener(admin_listener, s, h).await {
+                    eprintln!("[edge] admin listener error: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("[edge] cannot bind Admin {admin_addr}: {e}"),
+    }
 
     if let Some(ws_bind) = ws_addr {
         match TcpListener::bind(&ws_bind).await {
