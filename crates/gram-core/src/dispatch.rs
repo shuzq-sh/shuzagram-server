@@ -584,6 +584,7 @@ impl Dispatcher {
 
     /// Dispatch a single RPC query, returning the serialized result (or `rpc_error`).
     fn dispatch_query(&self, ctx: &mut ConnContext, qid: u32, r: &mut Reader) -> Vec<u8> {
+        eprintln!("[core] dispatch_query: qid={qid:#010x} auth_user={:?}", ctx.user.as_ref().map(|u| u.id));
         match qid {
             AUTH_BIND_TEMP_AUTH_KEY => self.auth_bind_temp_auth_key(ctx, r),
             AUTH_DROP_TEMP_AUTH_KEYS => self.auth_drop_temp_auth_keys(ctx, r),
@@ -711,6 +712,12 @@ impl Dispatcher {
             0xdaed_a864 => self.contacts_get_birthdays(ctx, r), // contacts.getBirthdays
             0xbdf9_3428 => self.messages_get_default_tag_reactions(ctx, r), // messages.getDefaultTagReactions
             0xd5a5_d3a1 => self.messages_get_stickers(ctx, r), // messages.getStickers
+            0x56da_0b3f => self.account_get_auto_download_settings(ctx, r), // account.getAutoDownloadSettings
+            0x3946_1db2 => self.messages_get_recent_reactions(ctx, r), // messages.getRecentReactions
+            0xbb81_25ba => self.messages_get_top_reactions(ctx, r), // messages.getTopReactions
+            0xe275_0328 => self.account_get_default_profile_photo_emojis(ctx, r), // account.getDefaultProfilePhotoEmojis
+            0xe190_2288 => self.account_get_saved_ringtones(ctx, r), // account.getSavedRingtones
+            0xb81b_93d4 => self.help_get_premium_promo(ctx, r), // help.getPremiumPromo
             0xa1b7_0815 => self.bots_get_bot_recommendations(ctx, r), // bots.getBotRecommendations
             0x5821_a5dc => self.stories_get_pinned_stories(ctx, r), // stories.getPinnedStories
             0x7488_ce5b | 0x1dd8_40f5 => self.messages_get_emoji_groups(ctx, r), // messages.getEmojiGroups / getEmojiStickerGroups
@@ -1463,13 +1470,30 @@ fn read_input_peer(r: &mut Reader, self_id: Option<i64>) -> Result<Option<Vec<u8
 /// `messages.getAllStickers` / `getEmojiStickers` / `getMaskStickers`
 fn messages_all_stickers(r: &mut Reader) -> Vec<u8> {
     let hash = r.read_i64().unwrap_or(0);
-    if hash == 1 {
+    if hash == 1004 {
         return empty_ctor(MESSAGES_ALL_STICKERS_NOT_MODIFIED);
     }
     let mut w = Writer::new();
     w.write_u32(MESSAGES_ALL_STICKERS);
-    w.write_i64(1); // hash
-    w.write_vector_header(0); // sets
+    w.write_i64(1004); // hash
+    w.write_vector_header(2); // 2 default sticker sets (Premium Gifts & TON Gifts)
+    w.write_u32(STICKER_SET);
+    w.write_i32(1 << 2); // official
+    w.write_i64(1004); // id
+    w.write_i64(1004i64.wrapping_mul(0x517c_c1b7_2722_0a95));
+    w.write_string("Premium Gifts");
+    w.write_string("PremiumGifts");
+    w.write_i32(3); // count
+    w.write_i32(1); // hash
+
+    w.write_u32(STICKER_SET);
+    w.write_i32(1 << 2); // official
+    w.write_i64(1005); // id
+    w.write_i64(1005i64.wrapping_mul(0x517c_c1b7_2722_0a95));
+    w.write_string("TON Gifts");
+    w.write_string("TonGifts");
+    w.write_i32(3); // count
+    w.write_i32(1); // hash
     w.into_vec()
 }
 
@@ -1522,6 +1546,61 @@ fn encode_empty_sticker_set(id: i64, short_name: &str, title: &str, is_emojis: b
     w.into_vec()
 }
 
+fn encode_sticker_set_with_docs(
+    id: i64,
+    short_name: &str,
+    title: &str,
+    is_emojis: bool,
+    doc_ids: &[i64],
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_STICKER_SET);
+    w.write_u32(STICKER_SET);
+    let mut flags = 1 << 2; // official
+    if is_emojis {
+        flags |= 1 << 7; // emojis
+    }
+    w.write_i32(flags);
+    w.write_i64(id);
+    w.write_i64(id.wrapping_mul(0x517c_c1b7_2722_0a95));
+    w.write_string(title);
+    w.write_string(short_name);
+    w.write_i32(doc_ids.len() as i32); // count
+    w.write_i32(1); // hash
+    // packs
+    w.write_vector_header(doc_ids.len());
+    for (i, &doc_id) in doc_ids.iter().enumerate() {
+        w.write_u32(0x12b1_267c); // stickerPack#12b1267c emoticon:string documents:Vector<long> = StickerPack;
+        w.write_string(if i % 3 == 0 { "🎁" } else if i % 3 == 1 { "⭐️" } else { "🎉" });
+        w.write_vector_header(1);
+        w.write_i64(doc_id);
+    }
+    w.write_vector_header(0); // keywords
+    // documents
+    w.write_vector_header(doc_ids.len());
+    for &doc_id in doc_ids {
+        w.write_u32(0x8fd4_c4d8); // document#8fd4c4d8
+        w.write_i32(0); // flags
+        w.write_i64(doc_id);
+        let ahash = doc_id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+        w.write_i64(ahash);
+        w.write_bytes(&[]); // file_reference
+        w.write_i32(1730000000); // date
+        w.write_string("application/x-tgsticker"); // mime_type
+        w.write_i64(60000); // size
+        w.write_i32(2); // dc_id
+        w.write_vector_header(2); // attributes
+        w.write_u32(0x6c37_c15c); // documentAttributeImageSize
+        w.write_i32(512);
+        w.write_i32(512);
+        w.write_u32(0x6319_d612); // documentAttributeSticker
+        w.write_i32(0);
+        w.write_string("⭐️");
+        w.write_u32(0xffb6_2b95); // inputStickerSetEmpty
+    }
+    w.into_vec()
+}
+
 /// `messages.getStickerSet#c8a0ec74 stickerset:InputStickerSet hash:int = messages.StickerSet`
 /// Never returns `TL_messages_stickerSetNotModified` when `set` fields are accessed
 /// (`TL_messages_stickerSetNotModified` subclasses `TL_messages_stickerSet` in Java with `set == null`!).
@@ -1540,9 +1619,11 @@ fn messages_get_sticker_set(r: &mut Reader) -> Vec<u8> {
             encode_empty_sticker_set(1003, "TopicIcons", "Topic Icons", true)
         }
         INPUT_STICKER_SET_PREMIUM_GIFTS => {
-            encode_empty_sticker_set(1004, "PremiumGifts", "Premium Gifts", false)
+            encode_sticker_set_with_docs(1004, "PremiumGifts", "Premium Gifts", false, &[5084588151377232306, 5082600084030357951, 5084864919069786886])
         }
-        INPUT_STICKER_SET_TON_GIFTS => encode_empty_sticker_set(1005, "TonGifts", "Gifts", false),
+        INPUT_STICKER_SET_TON_GIFTS => {
+            encode_sticker_set_with_docs(1005, "TonGifts", "TON Gifts", false, &[5116150036379469242, 5116286440245822791, 5118413754727400894])
+        }
         INPUT_STICKER_SET_EMOJI_DEFAULT_STATUSES => {
             encode_empty_sticker_set(1006, "DefaultStatuses", "Statuses", true)
         }
@@ -1565,9 +1646,11 @@ fn messages_get_sticker_set(r: &mut Reader) -> Vec<u8> {
                 }
                 "TopicIcons" => encode_empty_sticker_set(1003, "TopicIcons", "Topic Icons", true),
                 "PremiumGifts" => {
-                    encode_empty_sticker_set(1004, "PremiumGifts", "Premium Gifts", false)
+                    encode_sticker_set_with_docs(1004, "PremiumGifts", "Premium Gifts", false, &[5084588151377232306, 5082600084030357951, 5084864919069786886])
                 }
-                "TonGifts" => encode_empty_sticker_set(1005, "TonGifts", "Gifts", false),
+                "TonGifts" => {
+                    encode_sticker_set_with_docs(1005, "TonGifts", "TON Gifts", false, &[5116150036379469242, 5116286440245822791, 5118413754727400894])
+                }
                 "DefaultStatuses" => {
                     encode_empty_sticker_set(1006, "DefaultStatuses", "Statuses", true)
                 }

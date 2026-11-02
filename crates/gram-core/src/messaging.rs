@@ -2712,7 +2712,9 @@ impl Dispatcher {
 
         let loc_ctor = r.read_u32().unwrap_or(0);
         let file_id = match loc_ctor {
-            0xbad0_7284 | 0x4018_1ffe => {
+            // inputDocumentFileLocation#bad07584 id:long access_hash:long file_reference:bytes thumb_size:string
+            // inputPhotoFileLocation#40181ffe id:long access_hash:long file_reference:bytes thumb_size:string
+            0xbad0_7584 | 0xbad0_7284 | 0x4018_1ffe => {
                 let id = r.read_i64().unwrap_or(0);
                 let _access_hash = r.read_i64();
                 let _file_ref = r.read_bytes();
@@ -2731,14 +2733,24 @@ impl Dispatcher {
 
         let mut w = Writer::new();
         w.write_u32(0x096a_18d5); // upload.file#096a18d5
-        if let Some(blob) = self.store().acid().get_media_blob(file_id) {
+        let blob_opt = self.store().acid().get_media_blob(file_id)
+            .or_else(|| self.store().acid().get_any_gift_media_blob());
+
+        if let Some(blob) = blob_opt {
             let slice = if offset < blob.data_bytes.len() {
                 let end = (offset + limit).min(blob.data_bytes.len());
                 &blob.data_bytes[offset..end]
             } else {
                 &[]
             };
-            w.write_u32(0x007e_fe0e); // storage.fileJpeg#007efe0e
+            let type_ctor = match blob.mime_type.as_str() {
+                "image/jpeg" => 0x007e_fe0e, // storage.fileJpeg#007efe0e
+                "image/png" => 0x0a4f_63c0,  // storage.filePng#0a4f63c0
+                "image/webp" => 0x1081_446c, // storage.fileWebp#1081446c
+                "image/gif" => 0xcae1_aadf,  // storage.fileGif#cae1aadf
+                _ => 0x40bc_6f52,            // storage.filePartial#40bc6f52 (TGS animated stickers, chunks)
+            };
+            w.write_u32(type_ctor);
             w.write_i32(now_unix());
             w.write_bytes(slice);
         } else {
@@ -3207,7 +3219,7 @@ impl Dispatcher {
             w.write_i64(item.gift_id);
             // Full Document (document#8fd4c4d8) so client renders the visual gift card!
             w.write_u32(0x8fd4_c4d8); // document#8fd4c4d8
-            w.write_i32(0); // flags: no thumbs, no video_thumbs
+            w.write_i32(1); // flags: FLAG_0 thumbs present (required for animated sticker)
             w.write_i64(item.gift_id);
             let ahash = item.gift_id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
             w.write_i64(ahash);
@@ -3221,6 +3233,13 @@ impl Dispatcher {
             };
             w.write_string(&gift_mime); // mime_type
             w.write_i64(gift_size); // size
+            // thumbs (flag0): an invisible outline path so the client treats the
+            // .tgs as an animated sticker (MessageObject.isAnimatedStickerDocument
+            // requires a non-empty thumbs list).
+            w.write_vector_header(1);
+            w.write_u32(0xd821_4d41); // photoPathSize#d8214d41
+            w.write_string("j");
+            w.write_bytes(&[0x00, 0x80]); // "M0,0z" — draws nothing
             w.write_i32(2); // dc_id
             w.write_vector_header(2); // attributes
             // 1. image size
@@ -3527,9 +3546,40 @@ impl Dispatcher {
     }
 
     // messages.getStickers#d5a5d3a1 emoticon:string hash:long = messages.Stickers
-    pub fn messages_get_stickers(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    pub fn messages_get_stickers(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _emoticon = r.read_string().unwrap_or("");
+        let hash = r.read_i64().unwrap_or(0);
+        if hash != 0 {
+            let mut w = Writer::new();
+            w.write_u32(0xf174_9a22); // messages.stickersNotModified#f1749a22
+            return w.into_vec();
+        }
         let mut w = Writer::new();
-        w.write_u32(0xf174_9a22); // messages.stickersNotModified#f1749a22
+        w.write_u32(0x30a6_ec7e); // messages.stickers#30a6ec7e
+        w.write_i64(1); // hash
+        let catalog = self.store().acid().list_gift_catalog();
+        let count = catalog.len().min(30);
+        w.write_vector_header(count);
+        for item in &catalog[..count] {
+            w.write_u32(0x8fd4_c4d8); // document#8fd4c4d8
+            w.write_i32(0); // flags
+            w.write_i64(item.gift_id);
+            let ahash = item.gift_id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+            w.write_i64(ahash);
+            w.write_bytes(&[]); // file_reference
+            w.write_i32(1730000000); // date
+            w.write_string("application/x-tgsticker"); // mime_type
+            w.write_i64(50000); // size
+            w.write_i32(2); // dc_id
+            w.write_vector_header(2); // attributes
+            w.write_u32(0x6c37_c15c); // documentAttributeImageSize
+            w.write_i32(512);
+            w.write_i32(512);
+            w.write_u32(0x6319_d612); // documentAttributeSticker
+            w.write_i32(0);
+            w.write_string("⭐️");
+            w.write_u32(0xffb6_2b95); // inputStickerSetEmpty
+        }
         w.into_vec()
     }
 
@@ -3873,6 +3923,77 @@ impl Dispatcher {
         w.write_i64(0); // hash
         w.write_vector_header(0); // reactions
         w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // account.getAutoDownloadSettings#56da0b3f = account.AutoDownloadSettings
+    pub fn account_get_auto_download_settings(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x63ca_cf26); // account.autoDownloadSettings#63cacf26
+        // low, medium, high presets
+        for _ in 0..3 {
+            w.write_u32(0xbaa5_7628); // autoDownloadSettings#baa57628
+            w.write_i32(0); // flags
+            w.write_i32(1048576); // photo_size_max (1MB)
+            w.write_i64(10485760); // video_size_max (10MB)
+            w.write_i64(10485760); // file_size_max (10MB)
+            w.write_i32(1000); // video_upload_maxbitrate
+            w.write_i32(5); // small_queue_active_operations_max
+            w.write_i32(2); // large_queue_active_operations_max
+        }
+        w.into_vec()
+    }
+
+    // messages.getRecentReactions#39461db2 flags:# hash:long = messages.Reactions
+    pub fn messages_get_recent_reactions(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xeafc_32bc); // messages.reactions#eafc32bc
+        w.write_i64(0); // hash
+        w.write_vector_header(0); // reactions
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // messages.getTopReactions#bb8125ba flags:# hash:long = messages.Reactions
+    pub fn messages_get_top_reactions(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xeafc_32bc); // messages.reactions#eafc32bc
+        w.write_i64(0); // hash
+        w.write_vector_header(0); // reactions
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // account.getDefaultProfilePhotoEmojis#e2750328 hash:long = EmojiList
+    pub fn account_get_default_profile_photo_emojis(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x7a1e_22e1); // emojiList#7a1e22e1
+        w.write_i64(1); // hash
+        w.write_vector_header(0); // document_id
+        w.into_vec()
+    }
+
+    // account.getSavedRingtones#e1902288 hash:long = account.SavedRingtones
+    pub fn account_get_saved_ringtones(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xc1e9_2cc5); // account.savedRingtones#c1e92cc5
+        w.write_i64(1); // hash
+        w.write_vector_header(0); // ringtones
+        w.into_vec()
+    }
+
+    // help.getPremiumPromo#b81b93d4 = help.PremiumPromo
+    pub fn help_get_premium_promo(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x5334_759c); // help.premiumPromo#5334759c
+        w.write_string("Telegram Premium is unlocked on ShuzaGram!");
+        w.write_vector_header(0); // status_entities
+        w.write_vector_header(0); // video_sections
+        w.write_vector_header(0); // videos
+        w.write_vector_header(0); // period_options
         w.write_vector_header(0); // users
         w.into_vec()
     }

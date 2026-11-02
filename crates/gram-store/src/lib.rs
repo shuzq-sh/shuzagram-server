@@ -2610,6 +2610,33 @@ impl AcidStore {
         .flatten()
     }
 
+    pub fn get_any_gift_media_blob(&self) -> Option<MediaBlobRow> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT file_id, storage_dc_id, access_hash, owner_user_id, mime_type, file_name,
+                    byte_size, sha256_hex, data_bytes, created_at
+             FROM media_blobs WHERE mime_type = 'application/x-tgsticker' LIMIT 1",
+            [],
+            |r| {
+                Ok(MediaBlobRow {
+                    file_id: r.get(0)?,
+                    storage_dc_id: r.get(1)?,
+                    access_hash: r.get(2)?,
+                    owner_user_id: r.get(3)?,
+                    mime_type: r.get(4)?,
+                    file_name: r.get(5)?,
+                    byte_size: r.get(6)?,
+                    sha256_hex: r.get(7)?,
+                    data_bytes: r.get(8)?,
+                    created_at: r.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn save_file_part(&self, file_id: i64, file_part: i32, bytes: &[u8]) -> Result<(), StoreError> {
         let db = self.conn.lock().unwrap();
         db.execute(
