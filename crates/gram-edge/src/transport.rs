@@ -188,59 +188,89 @@ impl Conn {
     }
 }
 
-/// Run a connection: detect the transport, drive the DH handshake, then serve
-/// the authenticated session.
+use crate::keystore::KeyStore;
+
+/// Run a connection: detect the transport, then serve a unified loop that
+/// handles unencrypted handshake messages and encrypted session messages. The
+/// client may handshake then send encrypted traffic on the same connection, or
+/// open a new connection and send encrypted traffic with an already-known key.
 pub fn serve_connection(
     sock: TcpStream,
     rsa: &ServerRsaKey,
     dh: &DhParams,
     dispatcher: &Arc<Dispatcher>,
+    keys: &Arc<KeyStore>,
 ) -> io::Result<()> {
     let mut conn = Conn::accept(sock)?;
     let mut hs = HandshakeServer::new(rsa.clone(), dh.clone());
-
-    // Phase 1: unencrypted DH handshake.
-    let (auth_key, server_salt) = loop {
-        let payload = conn.read_frame()?;
-        let body = parse_bare(&payload)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad bare message"))?;
-
-        match hs.handle(body) {
-            Ok(Step::Reply(reply)) => {
-                conn.write_frame(&build_bare(&reply))?;
-            }
-            Ok(Step::Done {
-                reply,
-                auth_key,
-                auth_key_id,
-                server_salt,
-            }) => {
-                conn.write_frame(&build_bare(&reply))?;
-                eprintln!("[edge]   established auth_key id={auth_key_id:#018x}");
-                break (*auth_key, server_salt);
-            }
-            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-        }
-    };
-
-    // Phase 2: authenticated session — encrypted RPCs until disconnect.
-    let mut session = Session::new(auth_key, server_salt, 0);
+    let mut session: Option<Session> = None;
     let mut ctx = ConnContext::default();
+
     loop {
         let payload = match conn.read_frame() {
             Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let incoming = session
-            .decrypt(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        if session.session_id == 0 {
-            session.session_id = incoming.session_id;
+        if payload.len() < 8 {
+            continue;
+        }
+        let auth_key_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+
+        if auth_key_id == 0 {
+            // Unencrypted handshake message.
+            let Some(body) = parse_bare(&payload) else {
+                continue;
+            };
+            if body.len() >= 4 {
+                let cons = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                if cons == 0x62d6_b459 /* msgs_ack */ || cons == 0x7abe_77ec /* ping */ {
+                    continue;
+                }
+            }
+            match hs.handle(body) {
+                Ok(Step::Reply(reply)) => conn.write_frame(&build_bare(&reply))?,
+                Ok(Step::Done {
+                    reply,
+                    auth_key,
+                    auth_key_id,
+                    server_salt,
+                }) => {
+                    conn.write_frame(&build_bare(&reply))?;
+                    eprintln!("[edge]   established auth_key id={auth_key_id:#018x}");
+                    keys.insert(auth_key_id, *auth_key, server_salt);
+                    session = Some(Session::new(*auth_key, server_salt, 0));
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            }
+            continue;
+        }
+
+        // Encrypted message: ensure we have a session for this key.
+        if session.as_ref().map(|s| s.auth_key_id()) != Some(auth_key_id) {
+            let found = keys.get(auth_key_id);
+            match found {
+                Some((key, salt)) => session = Some(Session::new(key, salt, 0)),
+                None => {
+                    // Unknown key (handshake not seen yet): drop this connection.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("encrypted message for unknown auth_key_id {auth_key_id:#018x}"),
+                    ));
+                }
+            }
+        }
+        let s = session.as_mut().unwrap();
+        let incoming = match s.decrypt(&payload) {
+            Ok(m) => m,
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        };
+        if s.session_id == 0 {
+            s.session_id = incoming.session_id;
         }
         for reply in dispatcher.handle_message(&mut ctx, incoming.msg_id, &incoming.body) {
-            let seq = session.next_content_seq();
-            let enc = session.encrypt(next_message_id(), seq, &reply);
+            let seq = s.next_content_seq();
+            let enc = s.encrypt(next_message_id(), seq, &reply);
             conn.write_frame(&enc)?;
         }
     }

@@ -32,7 +32,8 @@ fn tcp_req_pq_returns_respq() {
         let rsa = ServerRsaKey::generate();
         let dh = dh::server_default();
         let dispatcher = Arc::new(Dispatcher::new(Arc::new(Store::new())));
-        let _ = transport::serve_connection(sock, &rsa, &dh, &dispatcher);
+        let keys = Arc::new(gram_edge::keystore::KeyStore::load(None));
+        let _ = transport::serve_connection(sock, &rsa, &dh, &dispatcher, &keys);
     });
 
     let mut c = TcpStream::connect(addr).unwrap();

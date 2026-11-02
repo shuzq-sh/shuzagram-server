@@ -55,7 +55,8 @@ fn full_login_over_tcp() {
         let (sock, _) = listener.accept().unwrap();
         let dh = dh::server_default();
         let dispatcher = Arc::new(Dispatcher::new(Arc::new(Store::new())));
-        let _ = transport::serve_connection(sock, &rsa_server, &dh, &dispatcher);
+        let keys = Arc::new(gram_edge::keystore::KeyStore::load(None));
+        let _ = transport::serve_connection(sock, &rsa_server, &dh, &dispatcher, &keys);
     });
 
     let mut client = Client::connect_and_handshake(addr, &rsa).expect("handshake");

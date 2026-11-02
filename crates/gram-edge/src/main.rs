@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gram_core::dispatch::DcEndpoint;
 use gram_core::{Dispatcher, Store};
+use gram_edge::keystore::KeyStore;
 use gram_edge::transport;
 use mtproto_crypto::dh;
 use mtproto_crypto::rsa_key::ServerRsaKey;
@@ -54,6 +55,15 @@ fn main() {
     };
     eprintln!("[edge] advertising dc{} at {}:{}", dc.dc_id, dc.ip, dc.port);
     let dispatcher = Arc::new(Dispatcher::new(store).with_dc(dc));
+    // Persist established auth keys next to the RSA key (or SHUZA_AUTHKEYS), so
+    // a client's cached key survives server restarts.
+    let keys_path = std::env::var("SHUZA_AUTHKEYS").ok().or_else(|| {
+        std::env::var("SHUZA_RSA_KEY").ok().map(|p| {
+            let dir = std::path::Path::new(&p).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            dir.join("authkeys.bin").to_string_lossy().into_owned()
+        })
+    });
+    let keys = Arc::new(KeyStore::load(keys_path));
     eprintln!(
         "[edge] rsa fingerprint = {:#018x}  (configure the client with this key)",
         rsa.fingerprint
@@ -74,12 +84,13 @@ fn main() {
                 let rsa = Arc::clone(&rsa);
                 let dh = dh.clone();
                 let dispatcher = Arc::clone(&dispatcher);
+                let keys = Arc::clone(&keys);
                 std::thread::spawn(move || {
                     let peer = sock
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
-                    match transport::serve_connection(sock, &rsa, &dh, &dispatcher) {
+                    match transport::serve_connection(sock, &rsa, &dh, &dispatcher, &keys) {
                         Ok(()) => eprintln!("[edge] {peer}: session closed"),
                         Err(e) => eprintln!("[edge] {peer}: {e}"),
                     }
