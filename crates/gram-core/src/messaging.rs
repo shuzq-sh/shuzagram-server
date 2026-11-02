@@ -2680,6 +2680,505 @@ impl Dispatcher {
         w.write_i32(0); // flags: 0
         w.into_vec()
     }
+
+    // --- Uploads & Downloads ------------------------------------------------
+
+    pub fn upload_save_file_part(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let file_id = r.read_i64().unwrap_or(0);
+        let file_part = r.read_i32().unwrap_or(0);
+        let bytes = r.read_bytes().unwrap_or_default();
+        let _ = self.store().acid().save_file_part(file_id, file_part, bytes);
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    pub fn upload_save_big_file_part(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let file_id = r.read_i64().unwrap_or(0);
+        let file_part = r.read_i32().unwrap_or(0);
+        let _total = r.read_i32();
+        let bytes = r.read_bytes().unwrap_or_default();
+        let _ = self.store().acid().save_file_part(file_id, file_part, bytes);
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    pub fn upload_get_file(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = self.require_auth_user(ctx).ok();
+        let flags = r.read_i32().unwrap_or(0);
+        let _precise = flags & (1 << 0) != 0;
+        let _cdn = flags & (1 << 1) != 0;
+
+        let loc_ctor = r.read_u32().unwrap_or(0);
+        let file_id = match loc_ctor {
+            0xbad0_7284 | 0x4018_1ffe => {
+                let id = r.read_i64().unwrap_or(0);
+                let _access_hash = r.read_i64();
+                let _file_ref = r.read_bytes();
+                let _thumb = r.read_string();
+                id
+            }
+            0x3725_7e99 => {
+                let _fl = r.read_i32();
+                let _peer = parse_input_peer(r, me.as_ref().map(|u| u.id));
+                r.read_i64().unwrap_or(0)
+            }
+            _ => r.read_i64().unwrap_or(0),
+        };
+        let offset = r.read_i64().unwrap_or(0).max(0) as usize;
+        let limit = r.read_i32().unwrap_or(128 * 1024).clamp(1, 1024 * 1024) as usize;
+
+        let mut w = Writer::new();
+        w.write_u32(0x096a_18d5); // upload.file#096a18d5
+        if let Some(blob) = self.store().acid().get_media_blob(file_id) {
+            let slice = if offset < blob.data_bytes.len() {
+                let end = (offset + limit).min(blob.data_bytes.len());
+                &blob.data_bytes[offset..end]
+            } else {
+                &[]
+            };
+            w.write_u32(0x007e_fe0e); // storage.fileJpeg#007efe0e
+            w.write_i32(now_unix());
+            w.write_bytes(slice);
+        } else {
+            w.write_u32(0xaa96_3b05); // storage.fileUnknown#aa963b05
+            w.write_i32(now_unix());
+            w.write_bytes(&[]);
+        }
+        w.into_vec()
+    }
+
+    // --- Profile Photos -----------------------------------------------------
+
+    pub fn photos_upload_profile_photo(&self, ctx: &mut ConnContext, r: &mut Reader, is_layer232: bool) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let input_file = if is_layer232 {
+            let flags = r.read_i32().unwrap_or(0);
+            if flags & (1 << 5) != 0 {
+                let _ = parse_input_peer(r, Some(me.id));
+            }
+            if flags & (1 << 0) != 0 {
+                parse_input_file(r)
+            } else {
+                None
+            }
+        } else {
+            parse_input_file(r)
+        };
+
+        let Some((file_id, parts, name)) = input_file else {
+            return rpc_error(400, "FILE_PARTS_INVALID");
+        };
+
+        let Ok(data_bytes) = self.store().acid().assemble_file_parts(file_id, parts) else {
+            return rpc_error(400, "FILE_PARTS_INVALID");
+        };
+
+        let access_hash = rand::random::<i64>().abs();
+        let _ = self.store().acid().store_media_blob(
+            file_id,
+            2,
+            access_hash,
+            me.id,
+            "image/jpeg",
+            &name,
+            "",
+            &data_bytes,
+        );
+
+        let _ = self.store().acid().update_user_photo(me.id, Some(file_id), Some(2));
+        if let Some(u) = ctx.user.as_mut() {
+            u.photo_id = Some(file_id);
+            u.photo_dc_id = Some(2);
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(0x2021_2ca8); // photos.photo
+        w.write_u32(0xfb19_7a65); // photo#fb197a65
+        w.write_i32(0); // flags
+        w.write_i64(file_id);
+        w.write_i64(access_hash);
+        w.write_bytes(&[]); // file_reference
+        w.write_i32(now_unix());
+        w.write_vector_header(1); // sizes
+        w.write_u32(0x75c7_8e60); // photoSize
+        w.write_string("m");
+        w.write_i32(320);
+        w.write_i32(320);
+        w.write_i32(data_bytes.len() as i32);
+        w.write_i32(2); // dc_id
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        w.write_vector_header(1);
+        w.write_raw(&me_tl);
+        w.into_vec()
+    }
+
+    pub fn photos_get_user_photos(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _flags = r.read_i32();
+        let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+        let target_uid = match target_peer {
+            Some(ParsedPeer::User(uid)) if uid != 0 => uid,
+            _ => me.id,
+        };
+        let user = self.store().user_by_id(target_uid).unwrap_or(me);
+        let mut w = Writer::new();
+        w.write_u32(0x8dca_6aa5); // photos.photos#8dca6aa5
+        if let Some(pid) = user.photo_id {
+            w.write_vector_header(1); // photos
+            w.write_u32(0xfb19_7a65); // photo#fb197a65
+            w.write_i32(0); // flags
+            w.write_i64(pid);
+            w.write_i64(user.access_hash);
+            w.write_bytes(&[]);
+            w.write_i32(now_unix());
+            w.write_vector_header(1);
+            w.write_u32(0x75c7_8e60); // photoSize
+            w.write_string("m");
+            w.write_i32(320);
+            w.write_i32(320);
+            w.write_i32(32768);
+            w.write_i32(user.photo_dc_id.unwrap_or(2));
+        } else {
+            w.write_vector_header(0);
+        }
+        w.write_vector_header(1); // users
+        w.write_raw(&self.render_user_for_viewer(&user, Some(user.id)));
+        w.into_vec()
+    }
+
+    pub fn photos_delete_photos(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    // --- Messages with Media ------------------------------------------------
+
+    pub fn messages_send_media(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        boxed_reply: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let peer = match parse_input_peer(r, Some(me.id)) {
+            Ok(Some(p)) => p,
+            _ => return rpc_error(400, "PEER_ID_INVALID"),
+        };
+        let reply_to_msg_id = if flags & (1 << 0) != 0 {
+            if boxed_reply {
+                let _ctor = r.read_u32();
+            }
+            r.read_i32().ok()
+        } else {
+            None
+        };
+
+        let Ok(media_ctor) = r.read_u32() else {
+            return rpc_error(400, "MEDIA_INVALID");
+        };
+
+        let mut assembled_media_tl = Vec::new();
+
+        match media_ctor {
+            // inputMediaUploadedPhoto
+            0x1e28_7d04 | 0x3560_6736 => {
+                let _fl = if media_ctor == 0x1e28_7d04 { r.read_i32().unwrap_or(0) } else { 0 };
+                if let Some((fid, parts, name)) = parse_input_file(r) {
+                    if let Ok(data) = self.store().acid().assemble_file_parts(fid, parts) {
+                        let ahash = rand::random::<i64>().abs();
+                        let _ = self.store().acid().store_media_blob(
+                            fid, 2, ahash, me.id, "image/jpeg", &name, "", &data,
+                        );
+                        let mut mw = Writer::new();
+                        mw.write_u32(0x6951_50d7); // messageMediaPhoto#695150d7
+                        mw.write_i32(0); // flags
+                        mw.write_u32(0xfb19_7a65); // photo#fb197a65
+                        mw.write_i32(0);
+                        mw.write_i64(fid);
+                        mw.write_i64(ahash);
+                        mw.write_bytes(&[]);
+                        mw.write_i32(now_unix());
+                        mw.write_vector_header(1);
+                        mw.write_u32(0x75c7_8e60); // photoSize
+                        mw.write_string("m");
+                        mw.write_i32(800);
+                        mw.write_i32(600);
+                        mw.write_i32(data.len() as i32);
+                        mw.write_i32(2); // dc_id
+                        assembled_media_tl = mw.into_vec();
+                    }
+                }
+            }
+            // inputMediaUploadedDocument
+            0x5b38_c6c1 => {
+                let _fl = r.read_i32().unwrap_or(0);
+                if let Some((fid, parts, name)) = parse_input_file(r) {
+                    let mime = r.read_string().unwrap_or("application/octet-stream");
+                    if let Ok(data) = self.store().acid().assemble_file_parts(fid, parts) {
+                        let ahash = rand::random::<i64>().abs();
+                        let _ = self.store().acid().store_media_blob(
+                            fid, 2, ahash, me.id, mime, &name, "", &data,
+                        );
+                        let mut mw = Writer::new();
+                        mw.write_u32(0x4cf4_d72d); // messageMediaDocument#4cf4d72d
+                        mw.write_i32(0); // flags
+                        mw.write_u32(0x8fd4_e4d8); // document#8fd4e4d8
+                        mw.write_i32(0);
+                        mw.write_i64(fid);
+                        mw.write_i64(ahash);
+                        mw.write_bytes(&[]);
+                        mw.write_i32(now_unix());
+                        mw.write_string(mime);
+                        mw.write_i64(data.len() as i64);
+                        mw.write_vector_header(0);
+                        mw.write_vector_header(0);
+                        mw.write_i32(2);
+                        mw.write_vector_header(0);
+                        assembled_media_tl = mw.into_vec();
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let message_text = r.read_string().unwrap_or_default();
+        let random_id = r.read_i64().unwrap_or(0);
+
+        let media_slice = if assembled_media_tl.is_empty() {
+            None
+        } else {
+            Some(assembled_media_tl.as_slice())
+        };
+
+        match peer {
+            ParsedPeer::User(target_uid) => {
+                let recip_id = if target_uid == 0 { me.id } else { target_uid };
+                let Ok(outcome) = self.store().acid().send_direct_message(
+                    me.id,
+                    recip_id,
+                    random_id,
+                    message_text,
+                    reply_to_msg_id,
+                    media_slice,
+                    None,
+                    None,
+                ) else {
+                    return rpc_error(500, "STORAGE_ERROR");
+                };
+
+                if !outcome.deduplicated {
+                    let sender_msg_tl = encode_tl_message(&outcome.sender_msg, false);
+                    let sender_upd = encode_update_new_message(&sender_msg_tl, outcome.sender_pts);
+                    let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+                    let my_push = encode_tl_updates(&[sender_upd], std::slice::from_ref(&me_tl), &[]);
+                    self.hub().push_to_user(me.id, Some(ctx.conn_id), my_push);
+
+                    if let Some((recip_msg, recip_pts)) = outcome.recipient_msg {
+                        let recip_msg_tl = encode_tl_message(&recip_msg, false);
+                        let recip_upd = encode_update_new_message(&recip_msg_tl, recip_pts);
+                        let recip_push = encode_tl_updates(&[recip_upd], &[me_tl], &[]);
+                        self.hub().push_to_user(recip_id, None, recip_push);
+                    }
+                }
+                encode_update_short_sent_message(
+                    outcome.sender_msg.msg_id,
+                    outcome.sender_pts,
+                    outcome.sender_msg.date_unix,
+                    media_slice,
+                    None,
+                )
+            }
+            ParsedPeer::Channel(cid) => {
+                let Ok(deliv) = self.store().acid().send_channel_message(
+                    me.id,
+                    cid,
+                    random_id,
+                    message_text,
+                    reply_to_msg_id,
+                    media_slice,
+                ) else {
+                    return rpc_error(500, "STORAGE_ERROR");
+                };
+                let is_post = deliv.channel.is_broadcast && !deliv.channel.is_megagroup;
+                let msg_tl = encode_tl_message(&deliv.msg, is_post);
+                let upd = encode_update_new_channel_message(&msg_tl, deliv.channel_pts);
+                let ch_tl = encode_tl_channel(&deliv.channel, me.id);
+                let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+                let push = encode_tl_updates(&[upd], &[me_tl], &[ch_tl]);
+                for sub in deliv.subscriber_ids {
+                    let exclude = if sub == me.id { Some(ctx.conn_id) } else { None };
+                    self.hub().push_to_user(sub, exclude, push.clone());
+                }
+                encode_update_short_sent_message(
+                    deliv.msg.msg_id,
+                    deliv.channel_pts,
+                    deliv.msg.date_unix,
+                    media_slice,
+                    None,
+                )
+            }
+            ParsedPeer::Chat(chat_id) => {
+                let Ok(deliv) = self.store().acid().send_chat_message(
+                    me.id,
+                    chat_id,
+                    random_id,
+                    message_text,
+                    reply_to_msg_id,
+                    media_slice,
+                ) else {
+                    return rpc_error(500, "STORAGE_ERROR");
+                };
+                for (member_uid, m_row, m_pts) in &deliv.member_deliveries {
+                    if *member_uid == me.id {
+                        continue;
+                    }
+                    let mb = encode_tl_message(m_row, false);
+                    let upd = encode_update_new_message(&mb, *m_pts);
+                    let chat_tl = encode_tl_chat(&deliv.chat, *member_uid);
+                    let sender_tl = self.render_user_for_viewer(&me, Some(*member_uid));
+                    let push = encode_tl_updates(&[upd], &[sender_tl], &[chat_tl]);
+                    self.hub().push_to_user(*member_uid, None, push);
+                }
+                encode_update_short_sent_message(
+                    deliv.sender_msg.msg_id,
+                    deliv.sender_pts,
+                    deliv.sender_msg.date_unix,
+                    media_slice,
+                    None,
+                )
+            }
+        }
+    }
+
+    pub fn messages_upload_media(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _peer = parse_input_peer(r, Some(me.id));
+        let Ok(media_ctor) = r.read_u32() else {
+            return rpc_error(400, "MEDIA_INVALID");
+        };
+        if media_ctor == 0x1e28_7d04 || media_ctor == 0x3560_6736 {
+            let _flags = if media_ctor == 0x1e28_7d04 { r.read_i32().unwrap_or(0) } else { 0 };
+            if let Some((fid, parts, name)) = parse_input_file(r) {
+                if let Ok(data) = self.store().acid().assemble_file_parts(fid, parts) {
+                    let ahash = rand::random::<i64>().abs();
+                    let _ = self.store().acid().store_media_blob(
+                        fid, 2, ahash, me.id, "image/jpeg", &name, "", &data,
+                    );
+                    let mut mw = Writer::new();
+                    mw.write_u32(0x6951_50d7); // messageMediaPhoto#695150d7
+                    mw.write_i32(0); // flags
+                    mw.write_u32(0xfb19_7a65); // photo#fb197a65
+                    mw.write_i32(0);
+                    mw.write_i64(fid);
+                    mw.write_i64(ahash);
+                    mw.write_bytes(&[]);
+                    mw.write_i32(now_unix());
+                    mw.write_vector_header(1);
+                    mw.write_u32(0x75c7_8e60); // photoSize
+                    mw.write_string("m");
+                    mw.write_i32(800);
+                    mw.write_i32(600);
+                    mw.write_i32(data.len() as i32);
+                    mw.write_i32(2);
+                    return mw.into_vec();
+                }
+            }
+        }
+        let mut w = Writer::new();
+        w.write_u32(0x3ded_6320); // messageMediaEmpty#3ded6320
+        w.into_vec()
+    }
+
+    pub fn messages_send_reaction(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_update_pinned_message(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn channels_edit_admin(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn channels_edit_title(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let title = r.read_string().unwrap_or_default();
+        if let Some(mut chan) = self.store().acid().channel_by_id(cid) {
+            chan.title = title.to_string();
+            let ch_tl = encode_tl_channel(&chan, me.id);
+            let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+            encode_tl_updates(&[], &[me_tl], &[ch_tl])
+        } else {
+            rpc_error(400, "CHANNEL_INVALID")
+        }
+    }
+
+    pub fn channels_edit_photo(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn channels_delete_channel(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_edit_chat_title(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_edit_chat_photo(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_add_chat_user(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+
+    pub fn messages_delete_chat_user(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        encode_tl_updates(&[], &[], &[])
+    }
+}
+
+fn parse_input_file(r: &mut Reader) -> Option<(i64, usize, String)> {
+    let Ok(ctor) = r.read_u32() else { return None };
+    match ctor {
+        0xf52f_f12b => {
+            let id = r.read_i64().ok()?;
+            let parts = r.read_i32().ok()?.max(1) as usize;
+            let name = r.read_string().unwrap_or_default();
+            let _md5 = r.read_string();
+            Some((id, parts, name.to_string()))
+        }
+        0xfa27_921a => {
+            let id = r.read_i64().ok()?;
+            let parts = r.read_i32().ok()?.max(1) as usize;
+            let name = r.read_string().unwrap_or_default();
+            Some((id, parts, name.to_string()))
+        }
+        _ => None,
+    }
 }
 
 fn read_message_id_list(r: &mut Reader, boxed_input_msg: bool) -> Vec<i32> {

@@ -586,6 +586,13 @@ impl AcidStore {
                 views           INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (peer_kind, peer_id, msg_id)
             );
+
+            CREATE TABLE IF NOT EXISTS file_parts (
+                file_id         INTEGER NOT NULL,
+                file_part       INTEGER NOT NULL,
+                bytes           BLOB NOT NULL,
+                PRIMARY KEY (file_id, file_part)
+            );
             ",
         )?;
 
@@ -2593,6 +2600,47 @@ impl AcidStore {
         .optional()
         .ok()
         .flatten()
+    }
+
+    pub fn save_file_part(&self, file_id: i64, file_part: i32, bytes: &[u8]) -> Result<(), StoreError> {
+        let db = self.conn.lock().unwrap();
+        db.execute(
+            "INSERT INTO file_parts (file_id, file_part, bytes)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (file_id, file_part) DO UPDATE SET bytes = excluded.bytes",
+            params![file_id, file_part, bytes],
+        )?;
+        Ok(())
+    }
+
+    pub fn assemble_file_parts(&self, file_id: i64, _total_parts: usize) -> Result<Vec<u8>, StoreError> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT bytes FROM file_parts WHERE file_id = ?1 ORDER BY file_part ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![file_id], |r| r.get::<_, Vec<u8>>(0))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        let total_bytes = rows.iter().map(|b| b.len()).sum();
+        let mut assembled = Vec::with_capacity(total_bytes);
+        for chunk in rows {
+            assembled.extend_from_slice(&chunk);
+        }
+        let _ = db.execute("DELETE FROM file_parts WHERE file_id = ?1", params![file_id]);
+        Ok(assembled)
+    }
+
+    pub fn update_user_photo(&self, user_id: i64, photo_id: Option<i64>, photo_dc_id: Option<i32>) -> Result<(), StoreError> {
+        let db = self.conn.lock().unwrap();
+        db.execute(
+            "UPDATE users SET photo_id = ?1, photo_dc_id = ?2 WHERE user_id = ?3",
+            params![photo_id, photo_dc_id, user_id],
+        )?;
+        Ok(())
     }
 
     // --- Stars Wallet, Double-Entry Ledger, Collectible Gifts & +888 --------

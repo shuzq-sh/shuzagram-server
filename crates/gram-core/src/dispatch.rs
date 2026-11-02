@@ -672,6 +672,34 @@ impl Dispatcher {
             0x9b5a_e7f9 => self.stories_get_all_read_peer_stories(ctx, r), // stories.getAllReadPeerStories
             0xb6c8_c393 => self.contacts_get_sponsored_peers(ctx, r), // contacts.getSponsoredPeers
 
+            // File Upload & Download
+            0xb304_a621 => self.upload_save_file_part(ctx, r), // upload.saveFilePart
+            0xde7b_673d => self.upload_save_big_file_part(ctx, r), // upload.saveBigFilePart
+            0xbe53_35be => self.upload_get_file(ctx, r), // upload.getFile
+
+            // Photos
+            0x0388_a3b5 => self.photos_upload_profile_photo(ctx, r, true), // photos.uploadProfilePhoto (L232)
+            0x89f3_0f69 => self.photos_upload_profile_photo(ctx, r, false), // photos.uploadProfilePhoto (legacy)
+            0x91cd_32a8 => self.photos_get_user_photos(ctx, r), // photos.getUserPhotos
+            0x87cf_7f2f => self.photos_delete_photos(ctx, r), // photos.deletePhotos
+
+            // Messages: Media, Reactions, Pinning
+            0x0330_e77f => self.messages_send_media(ctx, r, true), // messages.sendMedia (L232)
+            0x7852_8862 | 0xc8f1_4224 => self.messages_send_media(ctx, r, false), // messages.sendMedia (legacy)
+            0x519b_c2b1 => self.messages_upload_media(ctx, r), // messages.uploadMedia
+            0x2569_0ce4 => self.messages_send_reaction(ctx, r), // messages.sendReaction
+            0xdba6_e497 => self.messages_update_pinned_message(ctx, r), // messages.updatePinnedMessage
+
+            // Chat & Channel Administration
+            0xd33c_8902 => self.channels_edit_admin(ctx, r), // channels.editAdmin
+            0x566d_ecd0 => self.channels_edit_title(ctx, r), // channels.editTitle
+            0xf12e_5703 => self.channels_edit_photo(ctx, r), // channels.editPhoto
+            0xc011_1fe3 => self.channels_delete_channel(ctx, r), // channels.deleteChannel
+            0xdc45_28cd => self.messages_edit_chat_title(ctx, r), // messages.editChatTitle
+            0x35e9_6edd => self.messages_edit_chat_photo(ctx, r), // messages.editChatPhoto
+            0xf247_53e3 => self.messages_add_chat_user(ctx, r), // messages.addChatUser
+            0xa21e_741e => self.messages_delete_chat_user(ctx, r), // messages.deleteChatUser
+
             0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
             0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername
             0x3e0b_dd7c => self.account_update_username(ctx, r),  // account.updateUsername
