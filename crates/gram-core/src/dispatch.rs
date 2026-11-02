@@ -244,10 +244,11 @@ const CONTACTS_GET_TOP_PEERS: u32 = 0x9734_78b6;
 const CONTACTS_TOP_PEERS_NOT_MODIFIED: u32 = 0xde26_6ef5;
 
 const PAYMENTS_GET_SAVED_STAR_GIFTS: u32 = 0xa319_e569;
-const PAYMENTS_SAVED_STAR_GIFTS: u32 = 0x95f3_89b1;
+#[allow(dead_code)]
+pub const PAYMENTS_SAVED_STAR_GIFTS: u32 = 0x95f3_89b1;
 const PAYMENTS_GET_STARS_STATUS: u32 = 0x4ea9_b3bf;
-const PAYMENTS_STARS_STATUS: u32 = 0x6c9c_e8ed;
-const STARS_AMOUNT: u32 = 0xbbb6_b4a3;
+pub const PAYMENTS_STARS_STATUS: u32 = 0x6c9c_e8ed;
+pub const STARS_AMOUNT: u32 = 0xbbb6_b4a3;
 
 const STORIES_GET_ALL_STORIES: u32 = 0xeeb0_d625;
 const STORIES_ALL_STORIES_NOT_MODIFIED: u32 = 0x1158_fe3e;
@@ -783,8 +784,14 @@ impl Dispatcher {
 
             CONTACTS_GET_TOP_PEERS => empty_ctor(CONTACTS_TOP_PEERS_NOT_MODIFIED),
 
-            PAYMENTS_GET_SAVED_STAR_GIFTS => payments_saved_star_gifts_empty(),
-            PAYMENTS_GET_STARS_STATUS => payments_stars_status_empty(),
+            PAYMENTS_GET_SAVED_STAR_GIFTS | 0x18be_813b => self.payments_get_saved_star_gifts(ctx, r),
+            PAYMENTS_GET_STARS_STATUS | 0x104f_cfa7 => self.payments_get_stars_status(ctx, r),
+            0x69da_4545 | 0x69da_4557 => self.payments_get_stars_transactions(ctx, r),
+            0xd91f_fad6 | 0xd934_2f57 => self.payments_get_stars_revenue_stats(ctx, r),
+            0x2e6e_ab1a => self.payments_get_stars_subscriptions(ctx, r),
+            0x3714_8dbb => self.payments_get_payment_form(ctx, r),
+            0x7998_c914 | 0x2737_6c5b => self.payments_send_stars_form(ctx, r),
+            0x3ea2_05e2 => self.payments_save_star_gift(ctx, r),
 
             STORIES_GET_ALL_STORIES => stories_all_stories_not_modified(),
             STORIES_GET_PEER_STORIES => self.stories_peer_stories_empty(ctx, r),
@@ -1677,29 +1684,6 @@ fn account_authorizations_empty() -> Vec<u8> {
     w.write_u32(ACCOUNT_AUTHORIZATIONS);
     w.write_i32(180); // authorization_ttl_days
     w.write_vector_header(0); // authorizations
-    w.into_vec()
-}
-
-fn payments_saved_star_gifts_empty() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(PAYMENTS_SAVED_STAR_GIFTS);
-    w.write_i32(0); // flags
-    w.write_i32(0); // count
-    w.write_vector_header(0); // gifts
-    w.write_vector_header(0); // chats
-    w.write_vector_header(0); // users
-    w.into_vec()
-}
-
-fn payments_stars_status_empty() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(PAYMENTS_STARS_STATUS);
-    w.write_i32(0); // flags
-    w.write_u32(STARS_AMOUNT);
-    w.write_i64(0); // amount
-    w.write_i32(0); // nanos
-    w.write_vector_header(0); // chats
-    w.write_vector_header(0); // users
     w.into_vec()
 }
 

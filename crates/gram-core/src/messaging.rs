@@ -3175,9 +3175,300 @@ impl Dispatcher {
     }
 
     // payments.getStarGifts#c4563590 hash:int = payments.StarGifts
-    pub fn payments_get_star_gifts(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    pub fn payments_get_star_gifts(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let hash = r.read_i32().unwrap_or(0);
+        let catalog = self.store().acid().list_gift_catalog();
+        if hash != 0 && !catalog.is_empty() {
+            let mut w = Writer::new();
+            w.write_u32(0xa388_a368); // payments.starGiftsNotModified#a388a368
+            return w.into_vec();
+        }
         let mut w = Writer::new();
-        w.write_u32(0xa388_a368); // payments.starGiftsNotModified#a388a368
+        // payments.starGifts#2ed82995 hash:int gifts:Vector<StarGift> chats:Vector<Chat> users:Vector<User> = payments.StarGifts;
+        w.write_u32(0x2ed8_2995);
+        w.write_i32(12345); // hash
+        w.write_vector_header(catalog.len());
+        for item in &catalog {
+            // starGift#313a9547
+            w.write_u32(0x313a_9547);
+            let mut flags = 1 << 5; // title
+            if item.is_limited {
+                flags |= 1 << 0; // limited
+            }
+            if item.is_upgradeable {
+                flags |= 1 << 3; // upgrade_stars
+            }
+            w.write_i32(flags);
+            w.write_i64(item.gift_id);
+            // Dummy sticker Document (documentEmpty#36f8c871 id:long)
+            w.write_u32(0x36f8_c871);
+            w.write_i64(item.gift_id);
+            w.write_i64(item.star_price_units);
+            if item.is_limited {
+                let remains = (item.total_supply.unwrap_or(1000) - item.minted_count).max(0);
+                w.write_i32(remains);
+                w.write_i32(item.total_supply.unwrap_or(1000));
+            }
+            w.write_i64(item.convert_units);
+            if item.is_upgradeable {
+                w.write_i64(item.upgrade_price_units);
+            }
+            w.write_string(&item.title);
+        }
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // payments.getStarsStatus#4ea9b3bf / #104fcfa7
+    pub fn payments_get_stars_status(&self, ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let wallet = self.store().acid().ensure_user_stars_balance(me.id, 500);
+        let mut w = Writer::new();
+        w.write_u32(0x6c9c_e8ed); // PAYMENTS_STARS_STATUS
+        w.write_i32(0); // flags
+        w.write_u32(0xbbb6_b4a3); // STARS_AMOUNT
+        w.write_i64(wallet.balance_units); // amount in Stars
+        w.write_i32(0); // nanos
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // payments.getStarsTransactions#69da4545 / #69da4557
+    pub fn payments_get_stars_transactions(&self, ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let wallet = self.store().acid().ensure_user_stars_balance(me.id, 500);
+        let txs = self.store().acid().list_stars_transactions(Some(me.id), 50);
+
+        let mut w = Writer::new();
+        w.write_u32(0x6c9c_e8ed); // PAYMENTS_STARS_STATUS
+        let flags = if txs.is_empty() { 0 } else { 1 << 3 };
+        w.write_i32(flags);
+        w.write_u32(0xbbb6_b4a3); // STARS_AMOUNT
+        w.write_i64(wallet.balance_units);
+        w.write_i32(0); // nanos
+        if !txs.is_empty() {
+            w.write_vector_header(txs.len());
+            for tx in &txs {
+                // starsTransaction#cf696e38 flags:# id:string stars:StarsAmount date:int title:string ...
+                w.write_u32(0xcf69_6e38);
+                w.write_i32(0); // flags
+                w.write_string(&tx.tx_id);
+                w.write_u32(0xbbb6_b4a3);
+                w.write_i64(tx.delta_units);
+                w.write_i32(0); // nanos
+                w.write_i32(tx.created_at);
+                w.write_string(&tx.title);
+                w.write_u32(0x8a68_b577); // starsTransactionPartnerUnsupported
+            }
+        }
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // payments.getStarsRevenueStats#d91ffad6 / #d9342f57
+    pub fn payments_get_stars_revenue_stats(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x6c20_7376); // payments.starsRevenueStats#6c207376
+        w.write_i32(0); // flags
+        w.write_u32(0x8ea4_64b6); // statsGraph#8ea464b6
+        w.write_i32(0); // flags
+        w.write_u32(0x7d74_8d04); // dataJSON
+        w.write_string("{\"columns\":[]}");
+        w.write_u32(0x10d4_817a); // starsRevenueStatus#10d4817a
+        w.write_i32(0); // flags
+        w.write_u32(0xbbb6_b4a3);
+        w.write_i64(0); // current_balance
+        w.write_i32(0);
+        w.write_u32(0xbbb6_b4a3);
+        w.write_i64(0); // available_balance
+        w.write_i32(0);
+        w.write_u32(0xbbb6_b4a3);
+        w.write_i64(0); // overall_revenue
+        w.write_i32(0);
+        w.write_f64(0.013); // usd_rate
+        w.into_vec()
+    }
+
+    // payments.getStarsSubscriptions#2e6eab1a
+    pub fn payments_get_stars_subscriptions(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        self.payments_get_stars_status(ctx, r)
+    }
+
+    // payments.getSavedStarGifts#a319e569 / #18be813b
+    pub fn payments_get_saved_star_gifts(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _flags = r.read_i32().unwrap_or(0);
+        let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+        let target_uid = match target_peer {
+            Some(ParsedPeer::User(uid)) if uid != 0 => uid,
+            _ => me.id,
+        };
+
+        let gifts = self.store().acid().list_user_gifts(target_uid);
+        let mut w = Writer::new();
+        w.write_u32(0x95f3_89b1); // PAYMENTS_SAVED_STAR_GIFTS
+        w.write_i32(0); // flags
+        w.write_i32(gifts.len() as i32); // count
+        w.write_vector_header(gifts.len());
+        for g in &gifts {
+            w.write_u32(0x41df_43fc); // savedStarGift#41df43fc
+            let mut sflags = 0i32;
+            if g.sender_user_id.is_some() {
+                sflags |= 1 << 1;
+            }
+            if !g.message.is_empty() {
+                sflags |= 1 << 2;
+            }
+            if !g.is_upgraded {
+                sflags |= 1 << 10; // can_upgrade
+            }
+            sflags |= 1 << 11; // saved_id
+            if g.is_upgraded && g.serial_number.is_some() {
+                sflags |= 1 << 19; // gift_num
+            }
+            w.write_i32(sflags);
+            if let Some(s_uid) = g.sender_user_id {
+                w.write_u32(TL_PEER_USER);
+                w.write_i64(s_uid);
+            }
+            w.write_i32(g.minted_at);
+            if g.is_upgraded {
+                w.write_u32(0x85f0_a9cd); // starGiftUnique#85f0a9cd
+                w.write_i32(0); // flags
+                w.write_i64(g.instance_id); // id
+                w.write_i64(g.gift_id); // gift_id
+                let title = g.collectible_slug.clone().unwrap_or_else(|| "Collectible Gift".to_string());
+                w.write_string(&title);
+                let slug = g.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", g.instance_id));
+                w.write_string(&slug);
+                w.write_i32(g.serial_number.unwrap_or(1)); // num
+                w.write_vector_header(0); // attributes
+                w.write_i32(1); // availability_issued
+                w.write_i32(1000); // availability_total
+            } else {
+                w.write_u32(0x313a_9547); // starGift#313a9547
+                w.write_i32(1 << 3 | 1 << 5); // flags: upgrade_stars + title
+                w.write_i64(g.gift_id);
+                w.write_u32(0x36f8_c871); // documentEmpty
+                w.write_i64(g.gift_id);
+                w.write_i64(50); // stars
+                w.write_i64(40); // convert_stars
+                w.write_i64(25); // upgrade_stars
+                w.write_string("Star Gift");
+            }
+            if !g.message.is_empty() {
+                w.write_u32(0x751f_3146); // textWithEntities
+                w.write_string(&g.message);
+                w.write_vector_header(0);
+            }
+            w.write_i64(g.instance_id); // saved_id
+            if g.is_upgraded {
+                if let Some(num) = g.serial_number {
+                    w.write_i32(num);
+                }
+            }
+        }
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // payments.getPaymentForm#37148dbb
+    pub fn payments_get_payment_form(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _flags = r.read_i32().unwrap_or(0);
+        let form_id = rand::random::<i64>().abs().max(1);
+
+        let mut w = Writer::new();
+        w.write_u32(0xb425_cfe1); // payments.paymentFormStarGift#b425cfe1
+        w.write_i64(form_id);
+        w.write_u32(0x5fb4_c4d0); // invoice#5fb4c4d0
+        w.write_i32(0); // flags
+        w.write_string("XTR");
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    // payments.sendStarsForm#7998c914 / #27376c5b
+    pub fn payments_send_stars_form(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _form_id = r.read_i64().unwrap_or(0);
+        let ctor = r.read_u32().unwrap_or(0);
+        match ctor {
+            // inputInvoiceStarGift#e8625e92
+            0xe862_5e92 => {
+                let flags = r.read_i32().unwrap_or(0);
+                let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+                let recipient_id = match target_peer {
+                    Some(ParsedPeer::User(uid)) if uid != 0 => uid,
+                    _ => me.id,
+                };
+                let gift_id = r.read_i64().unwrap_or(5001);
+                let msg = if (flags & 2) != 0 {
+                    let _ctor = r.read_u32();
+                    r.read_string().unwrap_or_default().to_string()
+                } else {
+                    String::new()
+                };
+
+                let _ = self.store().acid().purchase_star_gift(me.id, recipient_id, gift_id, &msg);
+            }
+            // inputInvoiceStarGiftUpgrade#4d818d5d
+            0x4d81_8d5d => {
+                let _flags = r.read_i32();
+                let _sg_ctor = r.read_u32();
+                let _flags2 = r.read_i32();
+                let instance_id = r.read_i64().unwrap_or(0);
+                let _ = self.store().acid().upgrade_star_gift(me.id, instance_id);
+            }
+            // inputInvoiceStarGiftTransfer#4a5f5bd9
+            0x4a5f_5bd9 => {
+                let _sg_ctor = r.read_u32();
+                let _flags2 = r.read_i32();
+                let instance_id = r.read_i64().unwrap_or(0);
+                let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+                let recipient_id = match target_peer {
+                    Some(ParsedPeer::User(uid)) if uid != 0 => uid,
+                    _ => me.id,
+                };
+                let _ = self.store().acid().transfer_star_gift(me.id, recipient_id, instance_id);
+            }
+            _ => {}
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(0x4e71_ea61); // payments.paymentResult#4e71ea61
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(now_unix());
+        w.write_i32(0);
+        w.into_vec()
+    }
+
+    // payments.saveStarGift#3ea205e2
+    pub fn payments_save_star_gift(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
         w.into_vec()
     }
 

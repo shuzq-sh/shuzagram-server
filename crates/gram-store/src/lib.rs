@@ -2671,6 +2671,23 @@ impl AcidStore {
         })
     }
 
+    pub fn ensure_user_stars_balance(&self, user_id: i64, initial_grant: i64) -> StarsWalletRow {
+        let mut wallet = self.get_stars_wallet(user_id);
+        if wallet.balance_units == 0 && wallet.lifetime_minted == 0 {
+            if let Ok(w) = self.adjust_stars(
+                &format!("welcome_grant_{user_id}"),
+                user_id,
+                None,
+                "welcome_grant",
+                initial_grant,
+                "Welcome Bonus",
+            ) {
+                wallet = w;
+            }
+        }
+        wallet
+    }
+
     pub fn adjust_stars(
         &self,
         idempotency_key: &str,
