@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>shuzagram-server — Multi-DC MTProto 2.0 Rust Server &amp; Control Plane</title>
+    <dateCreated>Mon, 02 Nov 2026 06:53:00 GMT</dateCreated>
+    <expansionState>0,1,12,26,38,44,50</expansionState>
+  </head>
+  <body>
+    <outline text="shuzagram-server (Multi-DC MTProto 2.0 Rust Server &amp; Control Plane)">
+      <outline text="1. Core Workspace &amp; Toolchain">
+        <outline text="1.1 Rust Workspace (Edition 2024)">
+          <outline text="Protocol &amp; Crypto Crates">
+            <outline text="crates/mtproto-crypto">
+              <outline text="In-place AES-256-IGE (AES-NI / NEON register pipeline)"/>
+              <outline text="MTProto 2.0 KDF (ClientToServer x=0, ServerToClient x=8)"/>
+              <outline text="RSA-2048 OAEP &amp; legacy PKCS padding + SHA1 key fingerprint"/>
+              <outline text="Diffie-Hellman 2048-bit safe prime p, generator g, bounds check"/>
+              <outline text="Obfuscated2 64-byte header (AES-256-CTR rx/tx key derivation)"/>
+              <outline text="Fake-TLS (ee/dd secret HMAC-SHA256 ClientHello + SNI check)"/>
+            </outline>
+            <outline text="crates/tl-compiler">
+              <outline text="Build-time .tl lexer &amp; AST parser (canonical_layer_232.tl + mtproto_transport.tl)"/>
+              <outline text="CRC32 constructor ID validator &amp; bitmask flag layout calculator"/>
+              <outline text="Per-layer delta profile codegen (schemas/profiles/layer_170..231.json)"/>
+            </outline>
+            <outline text="crates/tl-core">
+              <outline text="Zero-copy traits (TlRead, TlWrite, TlBytes, TlStr, TlSliceIter)"/>
+              <outline text="Canonical Layer 232 domain-mapped TL types (#[repr(C)] fixed headers)"/>
+              <outline text="LayerAdapterRegistry translator + client quirk profiles (Desktop, Android, iOS, Web)"/>
+              <outline text="Recursive RPC wrapper unwrapping (invokeWithLayer, initConnection, invokeAfterMsg, max depth 8)"/>
+            </outline>
+            <outline text="crates/gram-proto">
+              <outline text="tonic + prost mTLS gRPC stubs from proto/federation.proto"/>
+              <outline text="NATS JetStream subject router &amp; binary envelope codecs"/>
+            </outline>
+          </outline>
+          <outline text="Runtime &amp; Service Crates">
+            <outline text="crates/gram-edge (Stateless MTProto Gateway)">
+              <outline text="monoio (io_uring thread-per-core) &amp; tokio listeners"/>
+              <outline text="6 transports: Abridged (0xef), Intermediate (0xeeeeeeee), Padded (0xdddddddd), Full TCP (CRC32), HTTP, WebSocket"/>
+              <outline text="Unencrypted DH handshake (req_pq_multi -&gt; req_DH_params -&gt; set_client_DH_params)"/>
+              <outline text="Session multiplexing, msg_container, gzip_packed, ping_delay_disconnect, get_future_salts"/>
+              <outline text="L1 DashMap + L2 Redis server_salt 3-slot window &amp; 128-bit msg_id replay bitmap"/>
+              <outline text="Per-IP and per-AuthKey admission byte &amp; inflight RPC budgets"/>
+            </outline>
+            <outline text="crates/gram-core (Stateful DC Router &amp; Domain Workers)">
+              <outline text="Home-DC enforcement (PHONE_MIGRATE_X, USER_MIGRATE_X, FILE_MIGRATE_X 303 errors)"/>
+              <outline text="Cross-DC auth.exportAuthorization &amp; auth.importAuthorization HMAC ticket engine"/>
+              <outline text="49 modular domain services migrated from gramsrv"/>
+            </outline>
+            <outline text="crates/gram-egress (Real-Time Update &amp; Push Dispatcher)">
+              <outline text="Session seq tracker &amp; layer-aware Updates serializer"/>
+              <outline text="Fast-path updates.getDifference &amp; updates.getChannelDifference"/>
+              <outline text="Background push adapters (FCM, APNs, UnifiedPush, WebPush)"/>
+            </outline>
+            <outline text="crates/gram-media (Distributed Multi-DC File Vault)">
+              <outline text="upload.saveFilePart, upload.saveBigFilePart, upload.getFile, upload.getCdnFile"/>
+              <outline text="28-byte HMAC-SHA256 file_reference verifier (storage_dc_id + 24h freshness)"/>
+              <outline text="S3/MinIO multi-DC buckets (gram-vault-dc1..5) + local NVMe read-through tier"/>
+            </outline>
+            <outline text="crates/gram-sfu (Voice, Video &amp; Group Calls)">
+              <outline text="webrtc-rs SFU media router + embedded STUN/TURN (12399/12400 UDP)"/>
+              <outline text="1:1 E2EE call signaling (phone.requestCall, acceptCall, confirmCall) &amp; groupCalls / RTMP"/>
+            </outline>
+            <outline text="crates/gram-botapi (HTTP Bot API Server)">
+              <outline text="Port 8081 JSON/multipart HTTP gateway bridged to gram-core bot sessions"/>
+            </outline>
+            <outline text="crates/gram-admin &amp; crates/gram-loadtest">
+              <outline text="axum Control Plane API (2599), RBAC, Argon2id auth, WebSocket telemetry &amp; lock-free RPC sniffer"/>
+              <outline text="Synthetic 100k-connection Multi-DC load &amp; migration chaos harness"/>
+            </outline>
+          </outline>
+        </outline>
+        <outline text="1.2 Frontend Workspace (web/admin-ui)">
+          <outline text="Next.js 15 App Router + TypeScript + TailwindCSS + shadcn/ui"/>
+          <outline text="Single-source navigation &amp; permission registry (src/config/nav.ts)"/>
+          <outline text="Interactive Multi-DC cluster graph (React Flow)"/>
+          <outline text="Real-time WebSocket charts &amp; live TL packet stream table"/>
+          <outline text="Tri-lingual localization (en, ru, zh)"/>
+        </outline>
+      </outline>
+
+      <outline text="2. Multi-DC Topology &amp; Federation (DC-1 .. DC-5+)">
+        <outline text="2.1 Data Center Roles">
+          <outline text="DC-1: Americas / Bootstrap Entry (Users Shard 1, Channels Shard 1, Vault 1)"/>
+          <outline text="DC-2: Europe / CIS Primary (Users Shard 2, Channels Shard 2, Vault 2)"/>
+          <outline text="DC-3: Dedicated High-Throughput Media &amp; Collectible Assets Vault"/>
+          <outline text="DC-4: Europe West High-Density Shard (Users Shard 4, Supergroups Shard 4)"/>
+          <outline text="DC-5: APAC / Singapore Shard (Users Shard 5, Channels Shard 5, Vault 5)"/>
+          <outline text="DC-203+: Stateless Edge CDN Nodes (cdn = true)"/>
+        </outline>
+        <outline text="2.2 Federation gRPC Services (proto/federation.proto)">
+          <outline text="CrossDcRelay">
+            <outline text="DeliverDirectMessage (idempotent cross-DC outbox -&gt; remote inbox + pts)"/>
+            <outline text="DeliverMessageEdit &amp; DeliverMessageDelete"/>
+            <outline text="DeliverReadHistory &amp; DeliverTypingAction"/>
+            <outline text="ResolvePeerProfile (EntityMinSnapshot + canonical TL bytes)"/>
+          </outline>
+          <outline text="AuthFederation">
+            <outline text="VerifyExportedAuth (76-byte SignedTicketBytes verification)"/>
+            <outline text="NotifyRemoteSessionTerminated (global AuthKey revocation)"/>
+            <outline text="MigrateUserHomeDc (zstd atomic bundle transfer + dc_epoch bump)"/>
+          </outline>
+          <outline text="ChannelFederation">
+            <outline text="PublishChannelMessage (routes to channel origin_dc_id)"/>
+            <outline text="FetchChannelDifference"/>
+            <outline text="MutateChannelMembership + NATS fed.channel.{id}.updates fan-out"/>
+          </outline>
+          <outline text="MediaRouter &amp; AdminControl">
+            <outline text="StreamFileChunk &amp; VerifyMediaReference"/>
+            <outline text="GetNodeHealth, PushClusterConfig, SetRpcSnifferFilter, ForceDisconnectAuthKey"/>
+          </outline>
+        </outline>
+        <outline text="2.3 State Synchronization Invariants">
+          <outline text="Account pts: Scoped (home_dc_id, user_id), contiguous via alloc_pts_and_append.lua + 2048-entry ZSET ring"/>
+          <outline text="Secret Chat qts: Scoped (home_dc_id, user_id), acknowledged via messages.receivedQueue"/>
+          <outline text="Channel channel_pts: Scoped (origin_dc_id, channel_id), O(1) write + NATS per-DC subscriber fan-out"/>
+          <outline text="Session seq: Scoped (edge_dc_id, auth_key_id, session_id) for ordered container delivery"/>
+        </outline>
+      </outline>
+
+      <outline text="3. Partitioned Storage Layer">
+        <outline text="3.1 PostgreSQL 17 (PARTITION BY LIST dc_id)">
+          <outline text="0001 Cluster &amp; Crypto: dc_clusters, rsa_keys, dh_configs"/>
+          <outline text="0002 Routing &amp; Users: global_directory_routing, users (dc1..dc5)"/>
+          <outline text="0003 AuthKeys &amp; Authorizations: auth_keys (dc1..dc5), user_authorizations (dc1..dc5)"/>
+          <outline text="0004 Dialogs, Messages &amp; Updates: dialogs, messages, pts_updates (dc1..dc5)"/>
+          <outline text="0005 Channels &amp; Forums: channels, channel_pts_updates (dc1..dc5)"/>
+          <outline text="0006 Media Volumes: media_blobs (dc1..dc5)"/>
+          <outline text="0007 Economy, Stars &amp; Gifts: stars_wallets, stars_ledger, gifts_catalog, user_gifts, virtual_numbers"/>
+          <outline text="0008 Admin RBAC &amp; Audit: admin_operators, admin_audit_log"/>
+        </outline>
+        <outline text="3.2 Redis / Dragonfly Atomic Lua Scripts">
+          <outline text="validate_salt_and_msgid.lua (3-slot salt window + 128-bit replay bitmap)"/>
+          <outline text="alloc_pts_and_append.lua (atomic INCRBY + bounded 2048-entry ZSET delta ring)"/>
+          <outline text="alloc_channel_pts.lua (atomic channel pts + NATS publish)"/>
+          <outline text="consume_export_auth.lua (idempotent cross-DC ticket verification &amp; AuthKey binding)"/>
+        </outline>
+      </outline>
+
+      <outline text="4. Domain &amp; TL Handler Groups (49 Modules in gram-core)">
+        <outline text="4.1 Identity, Auth &amp; Security">
+          <outline text="auth &amp; authdiagnostics (sendCode, signIn, signUp, logOut, export/importAuthorization, QR login)"/>
+          <outline text="passkey &amp; telegramlogin (WebAuthn passkeys &amp; OIDC widget login)"/>
+          <outline text="account &amp; privacy (2FA SRP-6a, sessions, TTL self-destruct, privacy rules, notifications)"/>
+          <outline text="users, userprojection, contacts, usernames (profiles, contact sync, collectible @usernames)"/>
+          <outline text="verification, botverification, rating, systemidentity (verified badges, trust rating, official notifications)"/>
+        </outline>
+        <outline text="4.2 Messaging, Social &amp; Real-Time">
+          <outline text="dialogs, chatlists, peerview, readmodel (folders, pinned dialogs, unread counters)"/>
+          <outline text="messages, ephemeral, welcomemessages (entities, albums, replies, forwards, View-Once/TTL, welcome)"/>
+          <outline text="updates (getState, getDifference, getChannelDifference, gap recovery)"/>
+          <outline text="channels, broadcast, communities (megagroups, forum topics, broadcast channels, discussion groups)"/>
+          <outline text="secretchat (E2EE DH chat negotiation &amp; qts encrypted queue)"/>
+          <outline text="polls, stories, themes, langpack, help (polls/quizzes, 24h stories, themes, i18n, DcOption config)"/>
+        </outline>
+        <outline text="4.3 Media, Voice/Video &amp; Bots">
+          <outline text="files (Multi-DC upload/download, photo sizes, documents, stickers, GIFs)"/>
+          <outline text="phone, groupcalls, livestream (1:1 calls, group voice/video rooms, RTMP ingest)"/>
+          <outline text="bots, autosubscribe, clienttelemetry, maintenance, moderation (inline bots, Mini-Apps, anti-abuse)"/>
+          <outline text="ai, transcription, translation (optional remote webhook adapters offloaded to external AI nodes)"/>
+        </outline>
+        <outline text="4.4 Economy, Stars &amp; Collectibles">
+          <outline text="stars, wallet, donations, premium (Stars subunit ledger, invoices, subscriptions, tips)"/>
+          <outline text="stargifts &amp; giftpack (Collectible NFT Gifts, .tgs animations, rarity upgrades, profile pinning, transfers)"/>
+        </outline>
+      </outline>
+
+      <outline text="5. Control Plane (gram-admin + web/admin-ui)">
+        <outline text="5.1 Cluster &amp; Multi-DC Topology (/topology/*)">
+          <outline text="/topology/map (topology.read / topology.drain): Live React Flow DC graph, CPU/RAM, sessions, RTT"/>
+          <outline text="/topology/dc-config (topology.write): Dynamic DcOption editor + live updateConfig broadcast"/>
+          <outline text="/topology/crypto (crypto.read / crypto.rotate): RSA-2048 key ring, DH prime rotation, FakeTLS secrets"/>
+        </outline>
+        <outline text="5.2 Accounts, Sessions &amp; Moderation (/accounts/*)">
+          <outline text="/accounts/directory (accounts.read / moderate / badges): Search &amp; badge/restriction controls"/>
+          <outline text="/accounts/sessions (sessions.read / terminate): Active AuthKey explorer &amp; instant Edge disconnect"/>
+          <outline text="/accounts/migrations (accounts.migrate_dc): Live one-click DC-X -&gt; DC-Y user state migration"/>
+        </outline>
+        <outline text="5.3 Economy, Stars &amp; Collectibles (/economy/*)">
+          <outline text="/economy/stars (economy.stars.read / mint): Mint/burn Stars, commissions, ledger, giveaway box"/>
+          <outline text="/economy/gifts (economy.gifts.read / write): Collectible NFT Gifts studio, .tgs uploader, upgrades, withdrawals"/>
+          <outline text="/economy/registry (economy.registry.read / assign): +888 anonymous numbers &amp; collectible @usernames"/>
+        </outline>
+        <outline text="5.4 Protocol Debugger &amp; Audit (/debug/*, /system/*)">
+          <outline text="/debug/sniffer (debug.sniffer.read / capture): Lock-free WebSocket live TL RPC inspector"/>
+          <outline text="/debug/layers (debug.layers.read / write): Connected client layer histogram &amp; downgrade rules"/>
+          <outline text="/system/operators (system.audit.read / operators.manage): Operator RBAC matrix &amp; immutable diff audit log"/>
+        </outline>
+      </outline>
+
+      <outline text="6. Six-Phase Execution Roadmap">
+        <outline text="Phase 1: Workspace, mtproto-crypto (SIMD AES-IGE, DH-2048, FakeTLS) &amp; tl-compiler/tl-core (Layer 232)"/>
+        <outline text="Phase 2: gram-edge Zero-Copy Multi-Transport Gateway &amp; Auth Handshake"/>
+        <outline text="Phase 3: gram-store (PG17 Partitioned DDL + Redis Lua) &amp; Single-DC gram-core + gram-egress MVP"/>
+        <outline text="Phase 4: Multi-DC Federation (DC-1..DC-5+, *_MIGRATE_X, export/importAuthorization, tonic + NATS)"/>
+        <outline text="Phase 5: gram-media S3 Vault, gram-sfu Calls, gram-botapi, Stars &amp; Collectible Gifts Engine"/>
+        <outline text="Phase 6: gram-admin + Next.js 15 Control Panel, Live DC Migration &amp; 100k-Session Load Gate"/>
+      </outline>
+    </outline>
+  </body>
+</opml>

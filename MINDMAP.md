@@ -1,0 +1,1 @@
+docs/MINDMAP.md

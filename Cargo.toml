@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mtproto-crypto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+authors = ["ShuzaGram"]
+repository = "https://github.com/shuzq-sh/shuzagram-server"
+
+[workspace.dependencies]
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+rsa = "0.9"
+num-bigint-dig = { version = "0.8", features = ["rand"] }
+num-integer = "0.1"
+num-traits = "0.2"
+rand = "0.8"
+subtle = "2.6"
+thiserror = "2.0"
+hex = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

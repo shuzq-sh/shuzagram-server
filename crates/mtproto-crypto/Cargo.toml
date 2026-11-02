@@ -1,0 +1,24 @@
+[package]
+name = "mtproto-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MTProto 2.0 cryptography: AES-256-IGE, KDF v2, RSA pad, DH-2048"
+
+[dependencies]
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+aes.workspace = true
+rsa.workspace = true
+num-bigint-dig.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
