@@ -11,9 +11,10 @@
 
 use num_bigint_dig::BigUint;
 use rand::RngCore;
+use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
 use rsa::traits::PrivateKeyParts;
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 
 use crate::{ige, sha1, sha256, sha256_parts, CryptoError};
 
@@ -37,6 +38,45 @@ impl ServerRsaKey {
         let mut rng = rand::thread_rng();
         let key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
         Self::from_rsa(&key)
+    }
+
+    /// Load a persistent key from `path` (PKCS#1 PEM), or generate one and save
+    /// it there (0600) if the file does not exist. Use this so the public key /
+    /// fingerprint embedded in the client stays stable across restarts.
+    pub fn load_or_generate(path: &str) -> std::io::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(pem) => {
+                let key = RsaPrivateKey::from_pkcs1_pem(&pem)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                Ok(Self::from_rsa(&key))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut rng = rand::thread_rng();
+                let key = RsaPrivateKey::new(&mut rng, 2048)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let pem = key
+                    .to_pkcs1_pem(LineEnding::LF)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                std::fs::write(path, pem.as_bytes())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                Ok(Self::from_rsa(&key))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The PKCS#1 public-key PEM (`BEGIN RSA PUBLIC KEY`) to embed in the client.
+    pub fn public_key_pkcs1_pem(&self) -> String {
+        let n = rsa::BigUint::from_bytes_be(&self.n_be);
+        let e = rsa::BigUint::from_bytes_be(&self.e_be);
+        RsaPublicKey::new(n, e)
+            .expect("valid modulus/exponent")
+            .to_pkcs1_pem(LineEnding::LF)
+            .expect("pkcs1 pem encode")
     }
 
     /// Build from an existing `rsa::RsaPrivateKey`.

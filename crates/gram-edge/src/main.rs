@@ -11,9 +11,31 @@ use mtproto_crypto::rsa_key::ServerRsaKey;
 fn main() {
     let addr = std::env::var("EDGE_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
 
-    eprintln!("[edge] generating server RSA-2048 key…");
-    let rsa = Arc::new(ServerRsaKey::generate());
+    // Persistent key if SHUZA_RSA_KEY points to a file; else an ephemeral key.
+    let rsa = match std::env::var("SHUZA_RSA_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(path) => {
+            eprintln!("[edge] loading server RSA-2048 key from {path}");
+            match ServerRsaKey::load_or_generate(&path) {
+                Ok(k) => Arc::new(k),
+                Err(e) => {
+                    eprintln!("[edge] cannot load/create key at {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            eprintln!("[edge] generating an ephemeral server RSA-2048 key (set SHUZA_RSA_KEY to persist)");
+            Arc::new(ServerRsaKey::generate())
+        }
+    };
     let dh = dh::server_default();
+
+    // If asked, print the public key to embed in the client, then exit.
+    if std::env::args().any(|a| a == "--print-pubkey") {
+        println!("fingerprint (u64): {:#018x}", rsa.fingerprint as u64);
+        println!("{}", rsa.public_key_pkcs1_pem());
+        return;
+    }
 
     // Test-server master code: read from the environment only, never hardcoded.
     // When set, any phone number registers with this code.
