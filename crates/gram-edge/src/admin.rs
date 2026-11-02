@@ -8,12 +8,65 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use gram_core::egress::SnifferFilter;
+use gram_core::messaging::{encode_tl_message, encode_tl_updates, encode_tl_user, encode_update_new_message};
 use gram_core::{SessionHub, Store};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn check_basic_auth(auth_header: Option<&str>) -> bool {
+    let expected_user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
+    let expected_pass = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+
+    let Some(header) = auth_header else {
+        return false;
+    };
+    if !header.starts_with("Basic ") {
+        return false;
+    }
+    let b64 = header["Basic ".len()..].trim();
+    let Some(decoded_bytes) = base64_decode(b64) else {
+        return false;
+    };
+    let Ok(credentials) = std::str::from_utf8(&decoded_bytes) else {
+        return false;
+    };
+    let mut parts = credentials.splitn(2, ':');
+    let user = parts.next().unwrap_or("");
+    let pass = parts.next().unwrap_or("");
+    user == expected_user && pass == expected_pass
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits = 0;
+    for &b in input.as_bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            break;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
 
 pub async fn serve_admin_listener(
     listener: TcpListener,
@@ -75,6 +128,31 @@ async fn handle_admin_client(
 
     let method = req.method.unwrap_or("GET");
     let path = req.path.unwrap_or("/");
+
+    let mut auth_header = None;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("authorization") {
+            if let Ok(s) = std::str::from_utf8(h.value) {
+                auth_header = Some(s.trim().to_string());
+            }
+        }
+    }
+
+    if method != "OPTIONS" && !check_basic_auth(auth_header.as_deref()) {
+        let resp = "HTTP/1.1 401 Unauthorized\r\n\
+                    WWW-Authenticate: Basic realm=\"ShuzaGram Control Plane\"\r\n\
+                    Content-Type: application/json\r\n\
+                    Content-Length: 31\r\n\
+                    Access-Control-Allow-Origin: *\r\n\
+                    Access-Control-Allow-Headers: *\r\n\
+                    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                    \r\n\
+                    {\"error\":\"Unauthorized access\"}";
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
     let body_bytes = if buf.len() >= body_offset {
         &buf[body_offset..body_offset + content_length.min(buf.len() - body_offset)]
     } else {
@@ -266,6 +344,61 @@ pub(crate) async fn handle_admin_route(
                 }
             }
         }
+        "/api/notifications/send" if method == "POST" => {
+            let val: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let broadcast = val.get("broadcast").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target_user_id = val.get("user_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            if text.is_empty() {
+                let res = json!({ "ok": false, "description": "Message text cannot be empty" });
+                return (400, "application/json", serde_json::to_vec(&res).unwrap_or_default());
+            }
+
+            let service_user = store.user_by_id(777000).unwrap_or_else(|| {
+                store.get_or_create_user("777000", Some("Telegram"), Some(""))
+            });
+
+            let targets: Vec<i64> = if broadcast {
+                store.acid().search_users("", 10000).into_iter()
+                    .map(|u| u.user_id)
+                    .filter(|&id| id >= 1000 && id != 777000)
+                    .collect()
+            } else if target_user_id > 0 {
+                vec![target_user_id]
+            } else {
+                Vec::new()
+            };
+
+            if targets.is_empty() {
+                let res = json!({ "ok": false, "description": "No valid recipient user specified" });
+                return (400, "application/json", serde_json::to_vec(&res).unwrap_or_default());
+            }
+
+            let mut delivered = 0;
+            for &uid in &targets {
+                let random_id = rand::random::<i64>().abs().max(1);
+                if let Ok(outcome) = store.acid().send_direct_message(
+                    777000, uid, random_id, text, None, None, None, None
+                ) {
+                    if let Some((recip_msg, recip_pts)) = outcome.recipient_msg {
+                        let recip_msg_tl = encode_tl_message(&recip_msg, false);
+                        let upd = encode_update_new_message(&recip_msg_tl, recip_pts);
+                        let srv_tl = encode_tl_user(&service_user, Some(uid), false, false, true);
+                        let push = encode_tl_updates(&[upd], &[srv_tl], &[]);
+                        hub.push_to_user(uid, None, push);
+                    }
+                    delivered += 1;
+                }
+            }
+
+            let res = json!({
+                "ok": true,
+                "delivered_count": delivered,
+                "total_targets": targets.len()
+            });
+            (200, "application/json", serde_json::to_vec(&res).unwrap_or_default())
+        }
         _ => (404, "application/json", b"{\"ok\":false,\"error\":\"Not Found\"}".to_vec()),
     }
 }
@@ -317,6 +450,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button onclick="setTab('sessions')" id="tab-sessions" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">Active Sessions</button>
       <button onclick="setTab('users')" id="tab-users" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">Users & Stars</button>
       <button onclick="setTab('gifts')" id="tab-gifts" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">Star Gifts Catalog</button>
+      <button onclick="setTab('notif')" id="tab-notif" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">📢 System Notifications</button>
     </div>
 
     <!-- Tab 1: Live RPC Sniffer -->
@@ -399,6 +533,52 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- Tab 5: System Notifications (777000) -->
+    <div id="view-notif" class="hidden space-y-6">
+      <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl max-w-2xl">
+        <h2 class="text-lg font-bold mb-2 flex items-center gap-2">
+          <span class="text-sky-400">📢</span>
+          <span>Официальные системные уведомления (Telegram 777000)</span>
+        </h2>
+        <p class="text-xs text-slate-400 mb-6">
+          Отправляет верифицированное системное push-уведомление от служебного аккаунта 777000. В клиентах отображается в официальном диалоге с синей галочкой.
+        </p>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs uppercase text-slate-400 font-semibold mb-2">Адресат</label>
+            <div class="flex gap-6 text-sm">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="notif_mode" value="broadcast" checked onchange="toggleNotifUser(false)" class="text-sky-500">
+                <span>Всем зарегистрированным пользователям (Broadcast)</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="notif_mode" value="single" onchange="toggleNotifUser(true)" class="text-sky-500">
+                <span>Одному пользователю</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="notif-user-container" class="hidden">
+            <label class="block text-xs uppercase text-slate-400 font-semibold mb-1">User ID</label>
+            <input id="notif-uid" type="number" placeholder="например 1002" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm text-slate-200 font-mono">
+          </div>
+
+          <div>
+            <label class="block text-xs uppercase text-slate-400 font-semibold mb-1">Текст уведомления</label>
+            <textarea id="notif-text" rows="4" placeholder="Введите текст системного уведомления..." class="w-full bg-slate-900 border border-slate-700 rounded p-3 text-sm text-slate-200"></textarea>
+          </div>
+
+          <div class="flex items-center justify-between pt-2">
+            <button onclick="sendSystemNotification()" class="px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded font-semibold text-sm transition cursor-pointer">
+              🚀 Отправить уведомление
+            </button>
+            <span id="notif-status" class="text-xs text-slate-400 font-mono"></span>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -406,7 +586,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     let snifferRows = [];
 
     function setTab(name) {
-      ['sniffer', 'sessions', 'users', 'gifts'].forEach(t => {
+      ['sniffer', 'sessions', 'users', 'gifts', 'notif'].forEach(t => {
         document.getElementById('view-' + t).classList.toggle('hidden', t !== name);
         document.getElementById('tab-' + t).classList.toggle('tab-active', t === name);
         document.getElementById('tab-' + t).classList.toggle('text-slate-400', t !== name);
@@ -525,6 +705,49 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       alert('Stars balance adjusted!');
       loadUsers();
     }
+
+    function toggleNotifUser(isSingle) {
+      document.getElementById('notif-user-container').classList.toggle('hidden', !isSingle);
+    }
+
+    async function sendSystemNotification() {
+      const isSingle = document.querySelector('input[name="notif_mode"]:checked').value === 'single';
+      const text = document.getElementById('notif-text').value.trim();
+      const statusEl = document.getElementById('notif-status');
+      if (!text) {
+        alert('Пожалуйста, введите текст сообщения');
+        return;
+      }
+      let uid = 0;
+      if (isSingle) {
+        uid = parseInt(document.getElementById('notif-uid').value);
+        if (!uid) {
+          alert('Укажите корректный User ID');
+          return;
+        }
+      }
+      statusEl.textContent = 'Отправка...';
+      try {
+        const res = await fetch('/api/notifications/send', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            broadcast: !isSingle,
+            user_id: uid,
+            text: text
+          })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          statusEl.textContent = `Успешно доставлено: ${data.delivered_count} получателям`;
+          document.getElementById('notif-text').value = '';
+        } else {
+          statusEl.textContent = `Ошибка: ${data.description || 'Не удалось отправить'}`;
+        }
+      } catch (e) {
+        statusEl.textContent = 'Ошибка сети: ' + e;
+      }
+    }
   </script>
 </body>
 </html>
@@ -582,5 +805,28 @@ mod tests {
         assert_eq!(status, 200);
         let res: Value = serde_json::from_slice(&body).unwrap();
         assert!(!res.as_array().unwrap().is_empty());
+
+        // Test system notifications
+        let notif_body = json!({
+            "user_id": user.id,
+            "broadcast": false,
+            "text": "Тестовое системное уведомление"
+        });
+        let (status, _, body) = handle_admin_route(
+            "POST",
+            "/api/notifications/send",
+            &serde_json::to_vec(&notif_body).unwrap(),
+            &store,
+            &hub,
+        ).await;
+        assert_eq!(status, 200);
+        let res: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["delivered_count"], 1);
+
+        // Test basic auth helper
+        assert!(check_basic_auth(Some("Basic YWRtaW46YWRtaW4="))); // admin:admin
+        assert!(!check_basic_auth(Some("Basic d3Jvbmc6cGFzcw==")));
+        assert!(!check_basic_auth(None));
     }
 }

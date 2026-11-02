@@ -609,6 +609,13 @@ impl AcidStore {
                 [],
             )?;
         }
+
+        // Seed official Telegram Service Notifications account (777000)
+        db.execute(
+            "INSERT OR IGNORE INTO users (user_id, home_dc_id, access_hash, phone, first_name, last_name, flags_bitmask, created_at)
+             VALUES (777000, ?1, 777000, '777000', 'Telegram', '', 1, 0)",
+            params![self.default_dc_id],
+        )?;
         Ok(())
     }
 
@@ -706,7 +713,7 @@ impl AcidStore {
         }
 
         let max_id: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(user_id), 999) FROM users",
+            "SELECT COALESCE(MAX(user_id), 999) FROM users WHERE user_id >= 1000",
             [],
             |r| r.get(0),
         )?;
