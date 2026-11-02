@@ -263,6 +263,8 @@ pub struct UserGiftRow {
     pub serial_number: Option<i32>,
     pub collectible_slug: Option<String>,
     pub is_upgraded: bool,
+    pub is_pinned: bool,
+    pub is_hidden: bool,
     pub message: String,
     pub minted_at: i32,
 }
@@ -601,6 +603,9 @@ impl AcidStore {
             );
             ",
         )?;
+
+        let _ = db.execute("ALTER TABLE user_gifts ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0", []);
+        let _ = db.execute("ALTER TABLE user_gifts ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0", []);
 
         // Seed default Collectible Star Gifts catalog if empty!
         let catalog_count: i64 =
@@ -2948,6 +2953,8 @@ impl AcidStore {
             serial_number: None,
             collectible_slug: None,
             is_upgraded: false,
+            is_pinned: false,
+            is_hidden: false,
             message: message.to_string(),
             minted_at: now,
         })
@@ -3056,8 +3063,8 @@ impl AcidStore {
         let mut stmt = db
             .prepare(
                 "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
-                        collectible_slug, is_upgraded, message, minted_at
-                 FROM user_gifts WHERE owner_user_id = ?1 ORDER BY instance_id DESC",
+                        collectible_slug, is_upgraded, is_pinned, is_hidden, message, minted_at
+                 FROM user_gifts WHERE owner_user_id = ?1 ORDER BY is_pinned DESC, instance_id DESC",
             )
             .unwrap();
         stmt.query_map(params![owner_user_id], |r| {
@@ -3069,8 +3076,10 @@ impl AcidStore {
                 serial_number: r.get(4)?,
                 collectible_slug: r.get(5)?,
                 is_upgraded: r.get::<_, i32>(6)? != 0,
-                message: r.get(7)?,
-                minted_at: r.get(8)?,
+                is_pinned: r.get::<_, i32>(7)? != 0,
+                is_hidden: r.get::<_, i32>(8)? != 0,
+                message: r.get(9)?,
+                minted_at: r.get(10)?,
             })
         })
         .unwrap()
@@ -3106,7 +3115,7 @@ impl AcidStore {
         let db = self.conn.lock().unwrap();
         db.query_row(
             "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
-                    collectible_slug, is_upgraded, message, minted_at
+                    collectible_slug, is_upgraded, is_pinned, is_hidden, message, minted_at
              FROM user_gifts WHERE collectible_slug = ?1",
             params![slug],
             |r| {
@@ -3118,8 +3127,10 @@ impl AcidStore {
                     serial_number: r.get(4)?,
                     collectible_slug: r.get(5)?,
                     is_upgraded: r.get::<_, i32>(6)? != 0,
-                    message: r.get(7)?,
-                    minted_at: r.get(8)?,
+                    is_pinned: r.get::<_, i32>(7)? != 0,
+                    is_hidden: r.get::<_, i32>(8)? != 0,
+                    message: r.get(9)?,
+                    minted_at: r.get(10)?,
                 })
             },
         )
@@ -3132,7 +3143,7 @@ impl AcidStore {
         let db = self.conn.lock().unwrap();
         db.query_row(
             "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
-                    collectible_slug, is_upgraded, message, minted_at
+                    collectible_slug, is_upgraded, is_pinned, is_hidden, message, minted_at
              FROM user_gifts WHERE instance_id = ?1",
             params![instance_id],
             |r| {
@@ -3144,14 +3155,116 @@ impl AcidStore {
                     serial_number: r.get(4)?,
                     collectible_slug: r.get(5)?,
                     is_upgraded: r.get::<_, i32>(6)? != 0,
-                    message: r.get(7)?,
-                    minted_at: r.get(8)?,
+                    is_pinned: r.get::<_, i32>(7)? != 0,
+                    is_hidden: r.get::<_, i32>(8)? != 0,
+                    message: r.get(9)?,
+                    minted_at: r.get(10)?,
                 })
             },
         )
         .optional()
         .ok()
         .flatten()
+    }
+
+    pub fn convert_star_gift(&self, user_id: i64, instance_id: i64) -> Result<i64, StoreError> {
+        let mut db = self.conn.lock().unwrap();
+        let tx = db.transaction()?;
+        let now = now_unix_i32();
+
+        let (gift_id, owner_id): (i64, i64) = tx
+            .query_row(
+                "SELECT gift_id, owner_user_id FROM user_gifts WHERE instance_id = ?1",
+                params![instance_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+
+        if owner_id != user_id {
+            return Err(StoreError::PermissionDenied);
+        }
+
+        let convert_units: i64 = tx
+            .query_row(
+                "SELECT convert_units FROM gifts_catalog WHERE gift_id = ?1",
+                params![gift_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        tx.execute("DELETE FROM user_gifts WHERE instance_id = ?1", params![instance_id])?;
+
+        if convert_units > 0 {
+            let cur_bal: i64 = tx
+                .query_row(
+                    "SELECT balance_units FROM stars_wallets WHERE user_id = ?1",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let new_bal = cur_bal + convert_units;
+            tx.execute(
+                "UPDATE stars_wallets SET balance_units = ?1, lifetime_minted = lifetime_minted + ?2, updated_at = ?3 WHERE user_id = ?4",
+                params![new_bal, convert_units, now, user_id],
+            )?;
+            let tx_key = format!("gift_conv_{instance_id}");
+            tx.execute(
+                "INSERT INTO stars_ledger (tx_id, idempotency_key, user_id, counterparty_id, tx_kind, delta_units, balance_after, title, created_at)
+                 VALUES (?1, ?1, ?2, NULL, 'gift_convert', ?3, ?4, 'Gift converted to Stars', ?5)",
+                params![tx_key, user_id, convert_units, new_bal, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(convert_units)
+    }
+
+    pub fn get_gift_convert_units(&self, gift_id: i64) -> Option<i64> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT convert_units FROM gifts_catalog WHERE gift_id = ?1",
+            params![gift_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn set_star_gift_saved(&self, user_id: i64, instance_id: i64, unsave: bool) -> Result<(), StoreError> {
+        let db = self.conn.lock().unwrap();
+        let cur_owner: Option<i64> = db
+            .query_row(
+                "SELECT owner_user_id FROM user_gifts WHERE instance_id = ?1",
+                params![instance_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = cur_owner {
+            if owner != user_id {
+                return Err(StoreError::PermissionDenied);
+            }
+            db.execute(
+                "UPDATE user_gifts SET is_hidden = ?1 WHERE instance_id = ?2",
+                params![if unsave { 1 } else { 0 }, instance_id],
+            )?;
+            Ok(())
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    pub fn toggle_pinned_gifts(&self, user_id: i64, instance_ids: &[i64]) -> Result<(), StoreError> {
+        let mut db = self.conn.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE user_gifts SET is_pinned = 0 WHERE owner_user_id = ?1", params![user_id])?;
+        for &id in instance_ids {
+            tx.execute("UPDATE user_gifts SET is_pinned = 1 WHERE instance_id = ?1 AND owner_user_id = ?2", params![id, user_id])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn issue_virtual_number(
@@ -3330,7 +3443,7 @@ fn query_user_gift_tx(
 ) -> Result<UserGiftRow, rusqlite::Error> {
     tx.query_row(
         "SELECT instance_id, gift_id, owner_user_id, sender_user_id, serial_number,
-                collectible_slug, is_upgraded, message, minted_at
+                collectible_slug, is_upgraded, is_pinned, is_hidden, message, minted_at
          FROM user_gifts WHERE instance_id = ?1",
         params![instance_id],
         |r| {
@@ -3342,8 +3455,10 @@ fn query_user_gift_tx(
                 serial_number: r.get(4)?,
                 collectible_slug: r.get(5)?,
                 is_upgraded: r.get::<_, i32>(6)? != 0,
-                message: r.get(7)?,
-                minted_at: r.get(8)?,
+                is_pinned: r.get::<_, i32>(7)? != 0,
+                is_hidden: r.get::<_, i32>(8)? != 0,
+                message: r.get(9)?,
+                minted_at: r.get(10)?,
             })
         },
     )

@@ -817,19 +817,25 @@ impl Dispatcher {
             CONTACTS_GET_TOP_PEERS => empty_ctor(CONTACTS_TOP_PEERS_NOT_MODIFIED),
 
             PAYMENTS_GET_SAVED_STAR_GIFTS | 0x18be_813b => self.payments_get_saved_star_gifts(ctx, r),
+            0xb455_a106 => self.payments_get_saved_star_gift(ctx, r),
             PAYMENTS_GET_STARS_STATUS | 0x104f_cfa7 => self.payments_get_stars_status(ctx, r),
             0x69da_4545 | 0x69da_4557 => self.payments_get_stars_transactions(ctx, r),
             0xd91f_fad6 | 0xd934_2f57 => self.payments_get_stars_revenue_stats(ctx, r),
             0x2e6e_ab1a => self.payments_get_stars_subscriptions(ctx, r),
             0x3714_8dbb => self.payments_get_payment_form(ctx, r),
             0x7998_c914 | 0x2737_6c5b => self.payments_send_stars_form(ctx, r),
-            0x3ea2_05e2 | 0x8265_3886 => self.payments_save_star_gift(ctx, r),
+            0x2a2a_697c | 0x3ea2_05e2 | 0x8265_3886 => self.payments_save_star_gift(ctx, r),
+            0x74bf_076b => self.payments_convert_star_gift(ctx, r),
+            0x7f18_176a => self.payments_transfer_star_gift(ctx, r),
+            0xaed6_e4f5 => self.payments_upgrade_star_gift(ctx, r),
+            0x1513_e7b0 => self.payments_toggle_star_gifts_pinned_to_top(ctx, r),
             0x9c9a_bcb1 => self.payments_get_star_gift_upgrade_preview(ctx, r),
             0x6d03_8b58 => self.payments_get_star_gift_upgrade_attributes(ctx, r),
             0xa197_4d72 => self.payments_get_unique_star_gift(ctx, r),
 
             STORIES_GET_ALL_STORIES => stories_all_stories_not_modified(),
             STORIES_GET_PEER_STORIES => self.stories_peer_stories_empty(ctx, r),
+            0xb435_2016 => self.stories_get_stories_archive(ctx, r),
 
             other => {
                 eprintln!("[core] unknown rpc {other:#010x} (key={:#018x})", ctx.auth_key_id);
@@ -1202,8 +1208,13 @@ impl Dispatcher {
         // TL_userFull#7fe738c4
         w.write_u32(USER_FULL);
         let full_flags = (1 << 4) | (1 << 7) | (1 << 13); // phone_calls_available | can_pin_message | video_calls_available
+        let gifts_count = self.store().acid().list_user_gifts(target.id).len() as i32;
+        let mut flags2 = 0i32;
+        if gifts_count > 0 {
+            flags2 |= (1 << 8) | (1 << 16); // stargifts_count (bit 8) | display_gifts_button (bit 16)
+        }
         w.write_i32(full_flags);
-        w.write_i32(0); // flags2
+        w.write_i32(flags2);
         w.write_i64(target.id);
         // PeerSettings#f47741f7
         w.write_u32(PEER_SETTINGS);
@@ -1212,6 +1223,9 @@ impl Dispatcher {
         w.write_u32(PEER_NOTIFY_SETTINGS);
         w.write_i32(0);
         w.write_i32(0); // common_chats_count
+        if (flags2 & (1 << 8)) != 0 {
+            w.write_i32(gifts_count); // stargifts_count
+        }
         w.write_vector_header(0); // chats
         w.write_vector_header(1); // users
         w.write_raw(&encode_user_for_viewer(&target, self_id));
@@ -2176,7 +2190,7 @@ fn encode_user(user: &User) -> Vec<u8> {
 
 /// Encode `TL_user#b1b8cc83`, setting `FLAG_10` (`self`) only when `user.id`
 /// matches the viewer's `self_id`.
-fn encode_user_for_viewer(user: &User, self_id: Option<i64>) -> Vec<u8> {
+pub(crate) fn encode_user_for_viewer(user: &User, self_id: Option<i64>) -> Vec<u8> {
     const FLAG_0: i32 = 1 << 0; // access_hash
     const FLAG_1: i32 = 1 << 1; // first_name
     const FLAG_2: i32 = 1 << 2; // last_name

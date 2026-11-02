@@ -8,14 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gram_store::{
-    ChannelRow, ChatRow, DialogRow, MessageRow, StoreError, PEER_CHANNEL as KIND_CHANNEL,
+    ChannelRow, ChatRow, DialogRow, MessageRow, StoreError, UserGiftRow, PEER_CHANNEL as KIND_CHANNEL,
     PEER_CHAT as KIND_CHAT, PEER_USER as KIND_USER, PTS_KIND_DELETE_MESSAGES,
     PTS_KIND_EDIT_MESSAGE, PTS_KIND_NEW_MESSAGE, PTS_KIND_READ_INBOX, PTS_KIND_READ_OUTBOX,
     USER_FLAG_BOT, USER_FLAG_FAKE, USER_FLAG_PREMIUM, USER_FLAG_SCAM, USER_FLAG_VERIFIED,
 };
 use tl_core::{Reader, TlError, Writer};
 
-use crate::dispatch::{rpc_error, ConnContext, Dispatcher};
+use crate::dispatch::{encode_user_for_viewer, rpc_error, ConnContext, Dispatcher};
 use crate::store::{normalize_phone, User};
 
 // --- Layer-232 Constructors (verified against ShuzaGramMod TLRPC.java) ------
@@ -3431,20 +3431,47 @@ impl Dispatcher {
             Ok(u) => u,
             Err(e) => return e,
         };
-        let _flags = r.read_i32().unwrap_or(0);
+        let flags = r.read_i32().unwrap_or(0);
         let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
         let target_uid = match target_peer {
             Some(ParsedPeer::User(uid)) if uid != 0 => uid,
             _ => me.id,
         };
+        if (flags & 64) != 0 {
+            let _collection_id = r.read_i32();
+        }
+        let _offset = r.read_string();
+        let _limit = r.read_i32();
 
         let gifts = self.store().acid().list_user_gifts(target_uid);
+        self.encode_saved_star_gifts_response(me.id, target_uid, &gifts)
+    }
+
+    // payments.getSavedStarGift#b455a106 stargift:Vector<InputSavedStarGift> = payments.SavedStarGifts;
+    pub fn payments_get_saved_star_gift(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let count = r.read_vector_header().unwrap_or(0);
+        let mut gifts = Vec::new();
+        for _ in 0..count {
+            if let Some(id) = self.parse_input_saved_star_gift(r) {
+                if let Some(g) = self.store().acid().get_user_gift_by_id(id) {
+                    gifts.push(g);
+                }
+            }
+        }
+        self.encode_saved_star_gifts_response(me.id, me.id, &gifts)
+    }
+
+    fn encode_saved_star_gifts_response(&self, viewer_id: i64, owner_id: i64, gifts: &[UserGiftRow]) -> Vec<u8> {
         let mut w = Writer::new();
         w.write_u32(0x95f3_89b1); // PAYMENTS_SAVED_STAR_GIFTS
         w.write_i32(0); // flags
         w.write_i32(gifts.len() as i32); // count
         w.write_vector_header(gifts.len());
-        for g in &gifts {
+        for g in gifts {
             w.write_u32(0x41df_43fc); // savedStarGift#41df43fc
             let mut sflags = 0i32;
             if g.sender_user_id.is_some() {
@@ -3458,6 +3485,13 @@ impl Dispatcher {
             if !g.is_upgraded {
                 sflags |= 1 << 10; // can_upgrade
                 sflags |= 1 << 6;  // upgrade_stars
+                sflags |= 1 << 4;  // convert_stars
+            }
+            if g.is_pinned {
+                sflags |= 1 << 12; // pinned_to_top
+            }
+            if g.is_hidden {
+                sflags |= 1 << 5; // unsaved
             }
             if g.is_upgraded && g.serial_number.is_some() {
                 sflags |= 1 << 19; // gift_num
@@ -3518,8 +3552,9 @@ impl Dispatcher {
                 w.write_u32(0xffb6_2b95); // inputStickerSetEmpty
 
                 let (price, upg) = self.store().acid().get_gift_prices(g.gift_id).unwrap_or((50, 25));
+                let conv = self.store().acid().get_gift_convert_units(g.gift_id).unwrap_or(40);
                 w.write_i64(price); // stars
-                w.write_i64(40); // convert_stars
+                w.write_i64(conv); // convert_stars
                 w.write_i64(upg); // upgrade_stars
                 w.write_string("Star Gift");
             }
@@ -3533,6 +3568,11 @@ impl Dispatcher {
             w.write_i32(g.instance_id as i32);
             // 6. saved_id (if 1 << 11)
             w.write_i64(g.instance_id);
+            // 6b. convert_stars (if 1 << 4)
+            if !g.is_upgraded {
+                let conv = self.store().acid().get_gift_convert_units(g.gift_id).unwrap_or(40);
+                w.write_i64(conv);
+            }
             // 7. upgrade_stars (if 1 << 6)
             if !g.is_upgraded {
                 let (_, upg) = self.store().acid().get_gift_prices(g.gift_id).unwrap_or((50, 25));
@@ -3545,8 +3585,24 @@ impl Dispatcher {
                 }
             }
         }
+        let mut user_ids = std::collections::HashSet::new();
+        user_ids.insert(owner_id);
+        for g in gifts {
+            if let Some(sid) = g.sender_user_id {
+                user_ids.insert(sid);
+            }
+        }
+        let mut users = Vec::new();
+        for uid in user_ids {
+            if let Some(u) = self.store().user_by_id(uid) {
+                users.push(u);
+            }
+        }
         w.write_vector_header(0); // chats
-        w.write_vector_header(0); // users
+        w.write_vector_header(users.len()); // users
+        for u in &users {
+            w.write_raw(&encode_user_for_viewer(u, Some(viewer_id)));
+        }
         w.into_vec()
     }
 
@@ -3710,7 +3766,7 @@ impl Dispatcher {
                     _ => me.id,
                 };
                 if let Some(instance_id) = instance_id_opt {
-                    let _ = self.store().acid().transfer_star_gift(me.id, recipient_id, instance_id);
+                    let _ = self.store().acid().transfer_star_gift(me.id, instance_id, recipient_id);
                 }
             }
             _ => {}
@@ -3734,11 +3790,16 @@ impl Dispatcher {
     }
 
     // payments.getStarGiftUpgradePreview#9c9abcb1 gift_id:long = payments.StarGiftUpgradePreview;
-    pub fn payments_get_star_gift_upgrade_preview(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    pub fn payments_get_star_gift_upgrade_preview(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let gift_id = r.read_i64().unwrap_or(0);
+        let (_, upg) = self.store().acid().get_gift_prices(gift_id).unwrap_or((50, 25));
         let mut w = Writer::new();
         w.write_u32(0x3de1_dfed); // starGiftUpgradePreview#3de1dfed
         w.write_vector_header(0); // sample_attributes
-        w.write_vector_header(0); // prices
+        w.write_vector_header(1); // prices
+        w.write_u32(0x99ea_331d); // StarGiftUpgradePrice#99ea331d
+        w.write_i32(now_unix());
+        w.write_i64(upg);
         w.write_vector_header(0); // next_prices
         w.into_vec()
     }
@@ -3785,10 +3846,166 @@ impl Dispatcher {
         w.into_vec()
     }
 
-    // payments.saveStarGift#3ea205e2
-    pub fn payments_save_star_gift(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    // payments.saveStarGift#2a2a697c / #3ea205e2 / #82653886
+    pub fn payments_save_star_gift(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let unsave = (flags & 1) != 0;
+        if let Some(gift_id) = self.parse_input_saved_star_gift(r) {
+            let _ = self.store().acid().set_star_gift_saved(me.id, gift_id, unsave);
+        }
         let mut w = Writer::new();
         w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    // payments.convertStarGift#74bf076b stargift:InputSavedStarGift = Bool;
+    pub fn payments_convert_star_gift(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        if let Some(gift_id) = self.parse_input_saved_star_gift(r) {
+            if let Err(_) = self.store().acid().convert_star_gift(me.id, gift_id) {
+                return rpc_error(400, "STARGIFT_INVALID");
+            }
+        }
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    // payments.transferStarGift#7f18176a stargift:InputSavedStarGift to_id:InputPeer = Updates;
+    pub fn payments_transfer_star_gift(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let gift_id = match self.parse_input_saved_star_gift(r) {
+            Some(id) => id,
+            None => return rpc_error(400, "STARGIFT_INVALID"),
+        };
+        let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+        let target_uid = match target_peer {
+            Some(ParsedPeer::User(uid)) if uid != 0 => uid,
+            _ => return rpc_error(400, "USER_ID_INVALID"),
+        };
+        if let Err(_) = self.store().acid().transfer_star_gift(me.id, gift_id, target_uid) {
+            return rpc_error(400, "STARGIFT_INVALID");
+        }
+        let mut w = Writer::new();
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(0); // updates
+        w.write_vector_header(0); // users
+        w.write_vector_header(0); // chats
+        w.write_i32(now_unix());  // date
+        w.write_i32(0);           // seq
+        w.into_vec()
+    }
+
+    // payments.upgradeStarGift#aed6e4f5 flags:# keep_original_details:flags.0?true stargift:InputSavedStarGift = Updates;
+    pub fn payments_upgrade_star_gift(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _flags = r.read_i32().unwrap_or(0);
+        let gift_id = match self.parse_input_saved_star_gift(r) {
+            Some(id) => id,
+            None => return rpc_error(400, "STARGIFT_INVALID"),
+        };
+        let upgraded = match self.store().acid().upgrade_star_gift(me.id, gift_id) {
+            Ok(g) => g,
+            Err(StoreError::InsufficientBalance) => return rpc_error(400, "BALANCE_TOO_LOW"),
+            Err(_) => return rpc_error(400, "STARGIFT_UPGRADE_FAILED"),
+        };
+        let bal = self.store().acid().ensure_user_stars_balance(me.id, 0).balance_units;
+        let mut w = Writer::new();
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(2); // 2 updates
+        // 1. updateStarsBalance
+        w.write_u32(0x4e80_a379);
+        w.write_u32(0xbbb6_b4a3); // starsAmount#bbb6b4a3
+        w.write_i64(bal);
+        w.write_i32(0);
+        // 2. updateNewMessage
+        w.write_u32(0x1f2b_0afd); // updateNewMessage#1f2b0afd
+        // messageService#2b085862
+        w.write_u32(0x2b08_5862);
+        let mflags = 1 << 8; // from_id
+        w.write_i32(mflags);
+        w.write_i32(upgraded.instance_id as i32); // id
+        // from_id: Peer
+        w.write_u32(TL_PEER_USER);
+        w.write_i64(me.id);
+        // peer_id: Peer
+        w.write_u32(TL_PEER_USER);
+        w.write_i64(me.id);
+        w.write_i32(now_unix()); // date
+        // action: messageActionStarGiftUnique#e6c31522
+        w.write_u32(0xe6c3_1522);
+        let aflags = 1 | (1 << 2); // upgrade:flags.0?true | saved:flags.2?true
+        w.write_i32(aflags);
+        // gift: StarGift (starGiftUnique#85f0a9cd)
+        w.write_u32(0x85f0_a9cd);
+        w.write_i32(0); // flags
+        w.write_i64(upgraded.instance_id);
+        w.write_i64(upgraded.gift_id);
+        let title = upgraded.collectible_slug.clone().unwrap_or_else(|| "Collectible Gift".to_string());
+        w.write_string(&title);
+        let slug = upgraded.collectible_slug.clone().unwrap_or_else(|| format!("gift-{}", upgraded.instance_id));
+        w.write_string(&slug);
+        w.write_i32(upgraded.serial_number.unwrap_or(1));
+        w.write_vector_header(0); // attributes
+        w.write_i32(1); // availability_issued
+        w.write_i32(1000); // availability_total
+        // updateNewMessage pts and pts_count
+        w.write_i32(1); // pts
+        w.write_i32(1); // pts_count
+
+        w.write_vector_header(0); // users
+        w.write_vector_header(0); // chats
+        w.write_i32(now_unix());  // date
+        w.write_i32(0);           // seq
+        w.into_vec()
+    }
+
+    // payments.toggleStarGiftsPinnedToTop#1513e7b0 peer:InputPeer stargift:Vector<InputSavedStarGift> = Bool;
+    pub fn payments_toggle_star_gifts_pinned_to_top(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _peer = parse_input_peer(r, Some(me.id));
+        let count = r.read_vector_header().unwrap_or(0);
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            if let Some(id) = self.parse_input_saved_star_gift(r) {
+                ids.push(id);
+            }
+        }
+        let _ = self.store().acid().toggle_pinned_gifts(me.id, &ids);
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    // stories.getStoriesArchive#b4352016 peer:InputPeer offset_id:int limit:int = stories.Stories;
+    pub fn stories_get_stories_archive(&self, ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let _me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let mut w = Writer::new();
+        w.write_u32(0x63c3_dd0a); // TL_stories_stories#63c3dd0a
+        w.write_i32(0); // flags
+        w.write_i32(0); // count
+        w.write_vector_header(0); // stories
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
         w.into_vec()
     }
 
