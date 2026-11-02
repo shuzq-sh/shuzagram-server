@@ -3,6 +3,7 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use gram_core::{Dispatcher, Store};
 use gram_edge::transport;
 use mtproto_crypto::dh;
 use mtproto_crypto::rsa_key::ServerRsaKey;
@@ -13,6 +14,7 @@ fn main() {
     eprintln!("[edge] generating server RSA-2048 key…");
     let rsa = Arc::new(ServerRsaKey::generate());
     let dh = dh::server_default();
+    let dispatcher = Arc::new(Dispatcher::new(Arc::new(Store::new())));
     eprintln!(
         "[edge] rsa fingerprint = {:#018x}  (configure the client with this key)",
         rsa.fingerprint
@@ -32,13 +34,14 @@ fn main() {
             Ok(sock) => {
                 let rsa = Arc::clone(&rsa);
                 let dh = dh.clone();
+                let dispatcher = Arc::clone(&dispatcher);
                 std::thread::spawn(move || {
                     let peer = sock
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
-                    match transport::serve_connection(sock, &rsa, &dh) {
-                        Ok(()) => eprintln!("[edge] {peer}: handshake complete"),
+                    match transport::serve_connection(sock, &rsa, &dh, &dispatcher) {
+                        Ok(()) => eprintln!("[edge] {peer}: session closed"),
                         Err(e) => eprintln!("[edge] {peer}: {e}"),
                     }
                 });

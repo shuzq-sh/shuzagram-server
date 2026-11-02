@@ -120,9 +120,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gram-core"
+version = "0.1.0"
+dependencies = [
+ "mtproto-crypto",
+ "rand",
+ "thiserror",
+ "tl-core",
+]
+
+[[package]]
 name = "gram-edge"
 version = "0.1.0"
 dependencies = [
+ "gram-core",
  "mtproto-crypto",
  "num-bigint-dig",
  "rand",

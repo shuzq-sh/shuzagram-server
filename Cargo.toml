@@ -4,6 +4,7 @@ members = [
     "crates/mtproto-crypto",
     "crates/tl-core",
     "crates/gram-edge",
+    "crates/gram-core",
 ]
 
 [workspace.package]

@@ -10,6 +10,7 @@ description = "MTProto transport gateway and DH handshake"
 [dependencies]
 tl-core = { path = "../tl-core" }
 mtproto-crypto = { path = "../mtproto-crypto" }
+gram-core = { path = "../gram-core" }
 num-bigint-dig.workspace = true
 rand.workspace = true
 thiserror.workspace = true

@@ -4,6 +4,9 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use std::sync::Arc;
+
+use gram_core::{Dispatcher, Store};
 use gram_edge::transport;
 use mtproto_crypto::{dh, rsa_key::ServerRsaKey};
 
@@ -28,7 +31,8 @@ fn tcp_req_pq_returns_respq() {
         let (sock, _) = listener.accept().unwrap();
         let rsa = ServerRsaKey::generate();
         let dh = dh::server_default();
-        let _ = transport::serve_connection(sock, &rsa, &dh);
+        let dispatcher = Arc::new(Dispatcher::new(Arc::new(Store::new())));
+        let _ = transport::serve_connection(sock, &rsa, &dh, &dispatcher);
     });
 
     let mut c = TcpStream::connect(addr).unwrap();

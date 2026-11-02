@@ -9,8 +9,10 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gram_core::{Dispatcher, Session};
 use mtproto_crypto::dh::DhParams;
 use mtproto_crypto::rsa_key::ServerRsaKey;
 
@@ -29,11 +31,13 @@ pub fn serve_connection(
     mut sock: TcpStream,
     rsa: &ServerRsaKey,
     dh: &DhParams,
+    dispatcher: &Arc<Dispatcher>,
 ) -> io::Result<()> {
     let transport = detect_transport(&mut sock)?;
     let mut hs = HandshakeServer::new(rsa.clone(), dh.clone());
 
-    loop {
+    // Phase 1: unencrypted DH handshake.
+    let (auth_key, server_salt) = loop {
         let payload = read_frame(&mut sock, transport)?;
         let body = parse_bare(&payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad bare message"))?;
@@ -49,18 +53,33 @@ pub fn serve_connection(
                 server_salt,
             }) => {
                 write_frame(&mut sock, transport, &build_bare(&reply))?;
-                // The 256-byte auth_key will be handed to the session layer
-                // (gram-core) once it exists; for now confirm its length.
-                debug_assert_eq!(auth_key.len(), 256);
-                eprintln!(
-                    "[edge]   established auth_key ({} bytes) id={auth_key_id:#018x} salt={server_salt:#018x}",
-                    auth_key.len()
-                );
-                return Ok(());
+                eprintln!("[edge]   established auth_key id={auth_key_id:#018x}");
+                break (*auth_key, server_salt);
             }
-            Err(e) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
-            }
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        }
+    };
+
+    // Phase 2: authenticated session — handle encrypted RPCs (auth.sendCode,
+    // auth.signIn, ping, …) until the client disconnects.
+    let mut session = Session::new(auth_key, server_salt, 0);
+    loop {
+        let payload = match read_frame(&mut sock, transport) {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let incoming = session
+            .decrypt(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // Adopt the client's session id so replies are addressed correctly.
+        if session.session_id == 0 {
+            session.session_id = incoming.session_id;
+        }
+        for reply in dispatcher.handle_message(incoming.msg_id, &incoming.body) {
+            let seq = session.next_content_seq();
+            let enc = session.encrypt(next_message_id(), seq, &reply);
+            write_frame(&mut sock, transport, &enc)?;
         }
     }
 }

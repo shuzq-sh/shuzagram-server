@@ -1,0 +1,14 @@
+[package]
+name = "gram-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Authenticated MTProto session layer and auth RPCs"
+
+[dependencies]
+tl-core = { path = "../tl-core" }
+mtproto-crypto = { path = "../mtproto-crypto" }
+rand.workspace = true
+thiserror.workspace = true
