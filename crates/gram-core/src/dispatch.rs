@@ -700,6 +700,20 @@ impl Dispatcher {
             0xf247_53e3 => self.messages_add_chat_user(ctx, r), // messages.addChatUser
             0xa21e_741e => self.messages_delete_chat_user(ctx, r), // messages.deleteChatUser
 
+            // Quick Replies, Gifts, Stickers & Bot Recommendations
+            0xd483_f2a8 => self.messages_get_quick_replies(ctx, r), // messages.getQuickReplies
+            0x2757_ba54 => self.payments_get_premium_gift_code_options(ctx, r), // payments.getPremiumGiftCodeOptions
+            0xc456_3590 => self.payments_get_star_gifts(ctx, r), // payments.getStarGifts
+            0xd5a5_d3a1 => self.messages_get_stickers(ctx, r), // messages.getStickers
+            0xa1b7_0815 => self.bots_get_bot_recommendations(ctx, r), // bots.getBotRecommendations
+            0x5821_a5dc => self.stories_get_pinned_stories(ctx, r), // stories.getPinnedStories
+            0x7488_ce5b | 0x1dd8_40f5 => self.messages_get_emoji_groups(ctx, r), // messages.getEmojiGroups / getEmojiStickerGroups
+            0x5545_1fa9 => self.phone_get_call_config(ctx, r), // phone.getCallConfig
+            0x08fc_711d => self.account_get_account_ttl(ctx, r), // account.getAccountTTL
+            0x4ea4_c80f => self.account_get_connected_bots(ctx, r), // account.getConnectedBots
+            0xf8b0_36af => self.channels_get_admined_public_channels(ctx, r), // channels.getAdminedPublicChannels
+            0x8d96_92a3 => self.messages_get_web_page(ctx, r), // messages.getWebPage
+
             0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
             0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername
             0x3e0b_dd7c => self.account_update_username(ctx, r),  // account.updateUsername

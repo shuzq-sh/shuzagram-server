@@ -3159,6 +3159,103 @@ impl Dispatcher {
     pub fn messages_delete_chat_user(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
         encode_tl_updates(&[], &[], &[])
     }
+
+    // messages.getQuickReplies#d483f2a8 hash:long = messages.QuickReplies
+    pub fn messages_get_quick_replies(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x5f91_eb5b); // messages.quickRepliesNotModified#5f91eb5b
+        w.into_vec()
+    }
+
+    // payments.getPremiumGiftCodeOptions#2757ba54 flags:# boost_peer:flags.0?InputPeer = Vector<PremiumGiftCodeOption>
+    pub fn payments_get_premium_gift_code_options(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    // payments.getStarGifts#c4563590 hash:int = payments.StarGifts
+    pub fn payments_get_star_gifts(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xa388_a368); // payments.starGiftsNotModified#a388a368
+        w.into_vec()
+    }
+
+    // messages.getStickers#d5a5d3a1 emoticon:string hash:long = messages.Stickers
+    pub fn messages_get_stickers(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xf174_9a22); // messages.stickersNotModified#f1749a22
+        w.into_vec()
+    }
+
+    // bots.getBotRecommendations#a1b70815 flags:# bot:flags.0?InputUser = users.Users
+    pub fn bots_get_bot_recommendations(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x7440_058b); // users.users#7440058b
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    // stories.getPinnedStories#5821a5dc peer:InputPeer offset_id:int limit:int = stories.Stories
+    pub fn stories_get_pinned_stories(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x63c3_dd0a); // stories.stories#63c3dd0a
+        w.write_i32(0); // flags
+        w.write_i32(0); // count
+        w.write_vector_header(0); // stories
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // messages.getEmojiGroups#7488ce5b hash:int = messages.EmojiGroups
+    pub fn messages_get_emoji_groups(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x6fb4_ad87); // messages.emojiGroupsNotModified#6fb4ad87
+        w.into_vec()
+    }
+
+    // phone.getCallConfig#55451fa9 = DataJSON
+    pub fn phone_get_call_config(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x7d74_8d04); // dataJSON#7d748d04
+        w.write_string("{}");
+        w.into_vec()
+    }
+
+    // account.getAccountTTL#08fc711d = AccountDaysTTL
+    pub fn account_get_account_ttl(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xb8d0_afdf); // accountDaysTTL#b8d0afdf
+        w.write_i32(365); // 365 days
+        w.into_vec()
+    }
+
+    // account.getConnectedBots#4ea4c80f = account.ConnectedBots
+    pub fn account_get_connected_bots(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x17d7_f87b); // account.connectedBots#17d7f87b
+        w.write_vector_header(0); // connected_bots
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // channels.getAdminedPublicChannels#f8b036af flags:# ... = messages.Chats
+    pub fn channels_get_admined_public_channels(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x64ff_9fd5); // messages.chats#64ff9fd5
+        w.write_vector_header(0); // chats
+        w.into_vec()
+    }
+
+    // messages.getWebPage#8d9692a3 url:string hash:int = WebPage
+    pub fn messages_get_web_page(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x211a_1788); // webPageEmpty#211a1788
+        w.write_i32(0); // flags
+        w.write_i64(0); // id
+        w.into_vec()
+    }
 }
 
 fn parse_input_file(r: &mut Reader) -> Option<(i64, usize, String)> {
