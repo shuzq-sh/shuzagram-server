@@ -2677,4 +2677,77 @@ mod tests {
         assert_eq!(r.read_i32().unwrap(), 0);
         assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
     }
+
+    #[test]
+    fn stars_and_gifts_end_to_end() {
+        let store = Arc::new(Store::with_test_code(Some("12345".into())));
+        let d = Dispatcher::new(store.clone());
+        let alice = store.sign_up("88888888888", "h1", "Alice", "").unwrap();
+        let mut ctx = ConnContext {
+            user: Some(alice.clone()),
+            auth_key_id: 0x1111,
+            session_id: 0x2222,
+            server_salt: 0x3333,
+            ..Default::default()
+        };
+
+        // 1. Get Stars status (auto grants 500 initial Stars)
+        let mut q = Writer::new();
+        q.write_u32(PAYMENTS_GET_STARS_STATUS);
+        q.write_u32(INPUT_PEER_SELF);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 201, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), PAYMENTS_STARS_STATUS);
+        assert_eq!(r.read_i32().unwrap(), 0);
+        assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
+        assert_eq!(r.read_i64().unwrap(), 500);
+
+        // 2. Fetch catalog via payments.getStarGifts
+        let mut q = Writer::new();
+        q.write_u32(0xc456_3590); // payments.getStarGifts
+        q.write_i32(0); // hash = 0
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 202, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x2ed8_2995); // payments.starGifts
+        let _hash = r.read_i32().unwrap();
+        let gift_count = r.read_vector_header().unwrap();
+        assert!(gift_count >= 3);
+
+        // 3. Purchase a Star Gift
+        let mut q = Writer::new();
+        q.write_u32(0x7998_c914); // payments.sendStarsForm
+        q.write_i64(12345); // form_id
+        q.write_u32(0xe862_5e92); // inputInvoiceStarGift
+        q.write_i32(0); // flags
+        q.write_u32(INPUT_PEER_SELF);
+        q.write_i64(5001); // Crystal Star (50 stars)
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 203, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x4e71_ea61); // payments.paymentResult
+
+        // 4. Verify Stars balance decreased to 450
+        let mut q = Writer::new();
+        q.write_u32(PAYMENTS_GET_STARS_STATUS);
+        q.write_u32(INPUT_PEER_SELF);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 204, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), PAYMENTS_STARS_STATUS);
+        assert_eq!(r.read_i32().unwrap(), 0);
+        assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
+        assert_eq!(r.read_i64().unwrap(), 450);
+
+        // 5. Fetch saved gifts on profile
+        let mut q = Writer::new();
+        q.write_u32(PAYMENTS_GET_SAVED_STAR_GIFTS);
+        q.write_i32(0); // flags
+        q.write_u32(INPUT_PEER_SELF);
+        q.write_string(""); // offset
+        q.write_i32(100); // limit
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 205, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), PAYMENTS_SAVED_STAR_GIFTS);
+        assert_eq!(r.read_i32().unwrap(), 0);
+        let count = r.read_i32().unwrap();
+        assert_eq!(count, 1);
+    }
 }
