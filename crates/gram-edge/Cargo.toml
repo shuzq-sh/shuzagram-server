@@ -15,7 +15,9 @@ num-bigint-dig.workspace = true
 aes.workspace = true
 ctr.workspace = true
 rand.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
+crc32fast.workspace = true
 
 [[bin]]
 name = "gram-edge"

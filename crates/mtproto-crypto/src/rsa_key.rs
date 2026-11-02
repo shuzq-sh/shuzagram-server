@@ -15,6 +15,7 @@ use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey, L
 use rsa::traits::PrivateKeyParts;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use subtle::ConstantTimeEq;
 
 use crate::{ige, sha1, sha256, sha256_parts, CryptoError};
 
@@ -196,24 +197,32 @@ impl ServerRsaKey {
         let data_with_padding: Vec<u8> = data_pad_reversed.iter().rev().copied().collect();
 
         let check = sha256_parts(&[&temp_key, &data_with_padding]);
-        if check.as_slice() != hash {
+        if check.ct_eq(hash).unwrap_u8() != 1 {
             return Err(CryptoError::MsgKeyMismatch);
         }
         Ok(data_with_padding)
     }
 
-    /// Legacy scheme: decrypted = `SHA1(data) || data || random_padding`.
-    /// Returns `data` (still followed by nothing; exact length recovered via the
-    /// embedded SHA1 is not possible without parsing, so we return the full tail
-    /// and let the caller TL-parse and re-hash to validate).
+    /// Legacy scheme: decrypted = `0x00 || SHA1(data)[20] || data || random_padding`.
     fn decrypt_legacy(&self, encrypted: &[u8; 256]) -> Result<Vec<u8>, CryptoError> {
         let m = self.decrypt_raw(encrypted);
-        // The leading byte of the 256-byte block is zero padding for a 2048-bit
-        // modulus; the SHA1 starts at offset 1.
+        // The leading byte of the 256-byte block must be zero for legacy padding;
+        // enforcing this rejects tampered RSA_PAD ciphertexts with high probability.
+        if m[0] != 0 {
+            return Err(CryptoError::MsgKeyMismatch);
+        }
         let body = &m[1..];
-        // body = SHA1(data)[20] || data || padding. We return the tail after the
-        // hash; validation happens once the caller knows the object length.
-        Ok(body[20..].to_vec())
+        let embedded_sha = &body[0..20];
+        let tail = &body[20..];
+        // Verify embedded SHA1 against possible 4-byte-aligned object lengths in tail.
+        let mut len = 4;
+        while len <= tail.len() {
+            if sha1(&tail[..len]).ct_eq(embedded_sha).unwrap_u8() == 1 {
+                return Ok(tail.to_vec());
+            }
+            len += 4;
+        }
+        Err(CryptoError::MsgKeyMismatch)
     }
 }
 
@@ -251,8 +260,12 @@ fn tl_bytes(out: &mut Vec<u8>, data: &[u8]) {
 fn to_be_256(n: &BigUint) -> [u8; 256] {
     let raw = n.to_bytes_be();
     let mut out = [0u8; 256];
-    let start = 256 - raw.len();
-    out[start..].copy_from_slice(&raw);
+    if raw.len() >= 256 {
+        out.copy_from_slice(&raw[raw.len() - 256..]);
+    } else {
+        let start = 256 - raw.len();
+        out[start..].copy_from_slice(&raw);
+    }
     out
 }
 
@@ -276,11 +289,7 @@ mod tests {
         let data = vec![0x42u8; 100];
         let mut enc = key.seal_pq_inner(&data);
         enc[200] ^= 0x01;
-        // Tampering should fail both schemes.
-        assert!(key.decrypt_pq_inner(&enc).is_err() || {
-            // legacy fallback returns garbage, not the original data
-            key.decrypt_pq_inner(&enc).unwrap()[..data.len()] != data[..]
-        });
+        assert!(key.decrypt_pq_inner(&enc).is_err());
     }
 
     #[test]

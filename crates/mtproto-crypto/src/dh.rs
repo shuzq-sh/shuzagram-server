@@ -124,8 +124,12 @@ impl DhParams {
 pub fn to_be_256(n: &BigUint) -> [u8; 256] {
     let raw = n.to_bytes_be();
     let mut out = [0u8; 256];
-    let start = 256 - raw.len();
-    out[start..].copy_from_slice(&raw);
+    if raw.len() >= 256 {
+        out.copy_from_slice(&raw[raw.len() - 256..]);
+    } else {
+        let start = 256 - raw.len();
+        out[start..].copy_from_slice(&raw);
+    }
     out
 }
 

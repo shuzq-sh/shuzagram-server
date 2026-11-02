@@ -12,3 +12,4 @@ tl-core = { path = "../tl-core" }
 mtproto-crypto = { path = "../mtproto-crypto" }
 rand.workspace = true
 thiserror.workspace = true
+flate2.workspace = true

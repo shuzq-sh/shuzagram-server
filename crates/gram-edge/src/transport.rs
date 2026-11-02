@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use gram_core::dispatch::{ConnContext, OutboundKind};
@@ -29,11 +29,16 @@ type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 /// and start a fresh DH handshake instead of reconnecting in an infinite loop.
 const TRANSPORT_ERR_UNKNOWN_KEY: i32 = -404;
 
+/// Idle read timeout so half-open mobile sockets never leak OS threads.
+const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Copy, PartialEq)]
 enum Inner {
     Abridged,
     Intermediate,
     PaddedIntermediate,
+    FullTcp,
 }
 
 /// A connection with its transport framing and (for obfuscated transports) the
@@ -44,11 +49,17 @@ struct Conn {
     inner: Inner,
     dec: Option<Aes256Ctr>, // decrypts client -> server
     enc: Option<Aes256Ctr>, // encrypts server -> client
+    first_full_header: Option<[u8; 4]>,
+    full_out_seq: u32,
 }
 
 impl Conn {
     /// Read the transport header, detecting plaintext vs obfuscated framing.
     fn accept(mut sock: TcpStream) -> io::Result<Conn> {
+        let _ = sock.set_nodelay(true);
+        let _ = sock.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
+        let _ = sock.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT));
+
         let mut b0 = [0u8; 1];
         sock.read_exact(&mut b0)?;
         if b0[0] == 0xef {
@@ -57,6 +68,8 @@ impl Conn {
                 inner: Inner::Abridged,
                 dec: None,
                 enc: None,
+                first_full_header: None,
+                full_out_seq: 0,
             });
         }
         // Read 3 more to complete the first 4 bytes.
@@ -68,6 +81,8 @@ impl Conn {
                 inner: Inner::Intermediate,
                 dec: None,
                 enc: None,
+                first_full_header: None,
+                full_out_seq: 0,
             });
         }
         if b0[0] == 0xdd && rest == [0xdd, 0xdd, 0xdd] {
@@ -76,14 +91,34 @@ impl Conn {
                 inner: Inner::PaddedIntermediate,
                 dec: None,
                 enc: None,
+                first_full_header: None,
+                full_out_seq: 0,
             });
         }
 
-        // Obfuscated2: the first 4 bytes are the start of a 64-byte nonce.
+        // Peek next 4 bytes to distinguish Full TCP (`seq_no == 0` and reasonable
+        // frame length `>= 12`) from 64-byte Obfuscated2 (which never has `bytes[4..8] == 0`).
+        let mut next4 = [0u8; 4];
+        sock.read_exact(&mut next4)?;
+        let first4 = [b0[0], rest[0], rest[1], rest[2]];
+        let cand_len = u32::from_le_bytes(first4);
+        let cand_seq = u32::from_le_bytes(next4);
+        if cand_seq == 0 && (12..=4 * 1024 * 1024).contains(&cand_len) && cand_len.is_multiple_of(4) {
+            return Ok(Conn {
+                sock,
+                inner: Inner::FullTcp,
+                dec: None,
+                enc: None,
+                first_full_header: Some(first4),
+                full_out_seq: 0,
+            });
+        }
+
+        // Obfuscated2: the first 8 bytes are the start of a 64-byte nonce.
         let mut nonce = [0u8; 64];
-        nonce[0] = b0[0];
-        nonce[1..4].copy_from_slice(&rest);
-        sock.read_exact(&mut nonce[4..])?;
+        nonce[0..4].copy_from_slice(&first4);
+        nonce[4..8].copy_from_slice(&next4);
+        sock.read_exact(&mut nonce[8..])?;
 
         // Keys: client->server uses nonce[8..40]/[40..56]; server->client uses
         // the reversed window nonce[8..56].
@@ -121,6 +156,8 @@ impl Conn {
             inner,
             dec: Some(dec),
             enc: Some(enc),
+            first_full_header: None,
+            full_out_seq: 0,
         })
     }
 
@@ -142,14 +179,15 @@ impl Conn {
         }
     }
 
-    /// Read one transport frame, returning its payload (a bare or encrypted
-    /// MTProto message).
-    fn read_frame(&mut self) -> io::Result<Vec<u8>> {
+    /// Read one transport frame, returning `(payload, quick_ack_requested)`.
+    fn read_frame(&mut self) -> io::Result<(Vec<u8>, bool)> {
         match self.inner {
             Inner::Intermediate | Inner::PaddedIntermediate => {
                 let mut len_buf = [0u8; 4];
                 self.read_exact(&mut len_buf)?;
-                let len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
+                let raw_len = u32::from_le_bytes(len_buf);
+                let quick_ack = (raw_len & 0x8000_0000) != 0;
+                let len = (raw_len & 0x7fff_ffff) as usize;
                 if len > 4 * 1024 * 1024 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -158,11 +196,12 @@ impl Conn {
                 }
                 let mut payload = vec![0u8; len];
                 self.read_exact(&mut payload)?;
-                Ok(payload)
+                Ok((payload, quick_ack))
             }
             Inner::Abridged => {
                 let mut b = [0u8; 1];
                 self.read_exact(&mut b)?;
+                let quick_ack = (b[0] & 0x80) != 0;
                 let first = b[0] & 0x7f; // high bit = quick-ack request
                 let words = if first < 0x7f {
                     first as usize
@@ -179,9 +218,55 @@ impl Conn {
                 }
                 let mut payload = vec![0u8; words * 4];
                 self.read_exact(&mut payload)?;
-                Ok(payload)
+                Ok((payload, quick_ack))
+            }
+            Inner::FullTcp => {
+                let (len_bytes, seq_bytes) = if let Some(first_len) = self.first_full_header.take() {
+                    // For the very first Full TCP packet, seq_no (0) was already consumed in accept().
+                    (first_len, 0u32.to_le_bytes())
+                } else {
+                    let mut hdr = [0u8; 8];
+                    self.read_exact(&mut hdr)?;
+                    (hdr[0..4].try_into().unwrap(), hdr[4..8].try_into().unwrap())
+                };
+                let total_len = u32::from_le_bytes(len_bytes) as usize;
+                if !(12..=4 * 1024 * 1024).contains(&total_len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid full tcp frame length {total_len}"),
+                    ));
+                }
+                let body_len = total_len - 12;
+                let mut payload = vec![0u8; body_len];
+                self.read_exact(&mut payload)?;
+                let mut crc_bytes = [0u8; 4];
+                self.read_exact(&mut crc_bytes)?;
+                let expected_crc = u32::from_le_bytes(crc_bytes);
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_bytes);
+                hasher.update(&seq_bytes);
+                hasher.update(&payload);
+                if hasher.finalize() != expected_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "full tcp crc32 mismatch",
+                    ));
+                }
+                Ok((payload, false))
             }
         }
+    }
+
+    /// Emit a 4-byte MTProto Quick-Ack token derived from `msg_key` when requested.
+    fn write_quick_ack(&mut self, msg_key: &[u8; 16]) -> io::Result<()> {
+        let token = u32::from_le_bytes(msg_key[0..4].try_into().unwrap()) | 0x8000_0000;
+        let bytes = match self.inner {
+            Inner::Abridged => token.swap_bytes().to_le_bytes(),
+            Inner::Intermediate | Inner::PaddedIntermediate => token.to_le_bytes(),
+            Inner::FullTcp => return Ok(()),
+        };
+        self.write_all(&bytes)?;
+        self.sock.flush()
     }
 
     /// Write one transport frame around `payload` (`payload.len()` is always a
@@ -208,6 +293,24 @@ impl Conn {
                 out.extend_from_slice(payload);
                 self.write_all(&out)?;
             }
+            Inner::FullTcp => {
+                let total_len = (12 + payload.len()) as u32;
+                let seq = self.full_out_seq;
+                self.full_out_seq = self.full_out_seq.wrapping_add(1);
+                let len_b = total_len.to_le_bytes();
+                let seq_b = seq.to_le_bytes();
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&len_b);
+                hasher.update(&seq_b);
+                hasher.update(payload);
+                let crc = hasher.finalize().to_le_bytes();
+                let mut out = Vec::with_capacity(total_len as usize);
+                out.extend_from_slice(&len_b);
+                out.extend_from_slice(&seq_b);
+                out.extend_from_slice(payload);
+                out.extend_from_slice(&crc);
+                self.write_all(&out)?;
+            }
         }
         self.sock.flush()
     }
@@ -232,9 +335,19 @@ pub fn serve_connection(
     let mut ctx = ConnContext::default();
 
     loop {
-        let payload = match conn.read_frame() {
+        let (payload, quick_ack) = match conn.read_frame() {
             Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         if payload.len() < 8 {
@@ -298,6 +411,10 @@ pub fn serve_connection(
             Ok(m) => m,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         };
+        if quick_ack && payload.len() >= 24 {
+            let msg_key: [u8; 16] = payload[8..24].try_into().unwrap();
+            conn.write_quick_ack(&msg_key)?;
+        }
         if s.session_id != incoming.session_id {
             s.session_id = incoming.session_id;
         }

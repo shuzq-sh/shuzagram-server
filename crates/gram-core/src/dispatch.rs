@@ -1,9 +1,13 @@
 //! RPC envelope unwrapping, MTProto service replies, PFS `bindTempAuthKey`,
 //! and Layer-232 auth / startup request routing.
 
+use std::io::Read as _;
 use std::sync::Arc;
 
+use flate2::read::GzDecoder;
+use mtproto_crypto::dh;
 use mtproto_crypto::kdf::{self, Direction};
+use rand::RngCore;
 use tl_core::{Reader, TlError, Writer};
 
 use crate::keystore::KeyStore;
@@ -11,6 +15,8 @@ use crate::store::{Store, User};
 
 // --- MTProto service & envelope constructors --------------------------------
 const MSG_CONTAINER: u32 = 0x73f1_f8dc;
+const GZIP_PACKED: u32 = 0x3072_cfa1;
+const MAX_GZIP_UNPACKED_LEN: usize = 4 * 1024 * 1024;
 const INVOKE_WITH_LAYER: u32 = 0xda9b_0d0d;
 const INIT_CONNECTION: u32 = 0xc1cd_5ea9;
 const INVOKE_AFTER_MSG: u32 = 0xcb9f_372d;
@@ -117,22 +123,127 @@ const MESSAGES_PEER_DIALOGS: u32 = 0x3371_c354;
 const MESSAGES_GET_DIALOG_FILTERS: u32 = 0xefd4_8c89;
 const MESSAGES_GET_DIALOG_FILTERS_LEGACY: u32 = 0xf19e_d96d;
 const MESSAGES_DIALOG_FILTERS: u32 = 0x2ad9_3719;
+const MESSAGES_GET_SUGGESTED_DIALOG_FILTERS: u32 = 0xa29c_d42c;
+const MESSAGES_UPDATE_DIALOG_FILTER: u32 = 0x1ad4_a04a;
 const MESSAGES_GET_ALL_STICKERS: u32 = 0xb8a0_a1a8;
+const MESSAGES_GET_EMOJI_STICKERS: u32 = 0xfbfc_a18f;
+const MESSAGES_GET_MASK_STICKERS: u32 = 0x640f_82b8;
+const MESSAGES_ALL_STICKERS: u32 = 0xcdbb_cebb;
 const MESSAGES_ALL_STICKERS_NOT_MODIFIED: u32 = 0xe866_02c3;
+const MESSAGES_GET_FEATURED_STICKERS: u32 = 0x6478_0b14;
+const MESSAGES_GET_FEATURED_EMOJI_STICKERS: u32 = 0x0ecf_6736;
+const MESSAGES_READ_FEATURED_STICKERS: u32 = 0x5b11_8126;
+const MESSAGES_FEATURED_STICKERS: u32 = 0xbe38_2906;
+const MESSAGES_FEATURED_STICKERS_NOT_MODIFIED: u32 = 0xc6dc_0c66;
+const MESSAGES_GET_ARCHIVED_STICKERS: u32 = 0x57f1_7692;
+const MESSAGES_ARCHIVED_STICKERS: u32 = 0x4fcb_a9c8;
+const MESSAGES_GET_STICKER_SET: u32 = 0xc8a0_ec74;
+const MESSAGES_STICKER_SET: u32 = 0x6e15_3f16;
+const STICKER_SET: u32 = 0x2dd1_4edc;
 const MESSAGES_GET_RECENT_STICKERS: u32 = 0x9da9_403b;
 const MESSAGES_RECENT_STICKERS_NOT_MODIFIED: u32 = 0x0b17_f890;
 const MESSAGES_GET_FAVED_STICKERS: u32 = 0x04f1_aaa9;
 const MESSAGES_FAVED_STICKERS_NOT_MODIFIED: u32 = 0x9e8f_a6d3;
+const MESSAGES_GET_SAVED_GIFS: u32 = 0x5cf0_9635;
+const MESSAGES_SAVED_GIFS: u32 = 0x84a0_2a0d;
+const MESSAGES_SAVED_GIFS_NOT_MODIFIED: u32 = 0xe802_5ca2;
 const MESSAGES_GET_AVAILABLE_REACTIONS: u32 = 0x18de_a0ac;
 const MESSAGES_AVAILABLE_REACTIONS_NOT_MODIFIED: u32 = 0x9f07_1957;
+const MESSAGES_GET_SEARCH_COUNTERS: u32 = 0x1bbc_f300;
+const MESSAGES_SEARCH_COUNTER: u32 = 0xe844_ebff;
+const MESSAGES_GET_SEARCH_RESULTS_POSITIONS: u32 = 0x9c7f_2f10;
+const MESSAGES_SEARCH_RESULTS_POSITIONS: u32 = 0x53b2_2baf;
+const MESSAGES_GET_ATTACH_MENU_BOTS: u32 = 0x16fc_c2cb;
+const ATTACH_MENU_BOTS: u32 = 0x3c43_01c0;
+const ATTACH_MENU_BOTS_NOT_MODIFIED: u32 = 0xf1d8_8a5c;
+const MESSAGES_GET_DEFAULT_HISTORY_TTL: u32 = 0x658b_7188;
+const DEFAULT_HISTORY_TTL: u32 = 0x43b4_6b20;
+const HELP_DISMISS_SUGGESTION: u32 = 0xf50d_baa1;
+
+const INPUT_STICKER_SET_EMPTY: u32 = 0xffb6_2b95;
+const INPUT_STICKER_SET_ID: u32 = 0x9de7_a269;
+const INPUT_STICKER_SET_SHORT_NAME: u32 = 0x861c_c8a0;
+const INPUT_STICKER_SET_ANIMATED_EMOJI: u32 = 0x0287_03c8;
+const INPUT_STICKER_SET_DICE: u32 = 0xe67f_520e;
+const INPUT_STICKER_SET_DICE_LAYER111: u32 = 0x79e2_1a53;
+const INPUT_STICKER_SET_PREMIUM_GIFTS: u32 = 0xc88b_3b02;
+const INPUT_STICKER_SET_TON_GIFTS: u32 = 0x1cf6_71a0;
+const INPUT_STICKER_SET_EMOJI_DEFAULT_STATUSES: u32 = 0x29d0_f5ee;
+const INPUT_STICKER_SET_EMOJI_CHANNEL_DEFAULT_STATUSES: u32 = 0x4974_8553;
+const INPUT_STICKER_SET_EMOJI_GENERIC_ANIMATIONS: u32 = 0x04c4_d4ce;
+const INPUT_STICKER_SET_EMOJI_DEFAULT_TOPIC_ICONS: u32 = 0x44c1_f8e9;
+
+const INPUT_MESSAGES_FILTER_PHONE_CALLS: u32 = 0x80c9_9768;
+
+const INPUT_USER_EMPTY: u32 = 0xb988_86cf;
+const INPUT_USER_SELF: u32 = 0xf7c1_b13f;
+const INPUT_USER: u32 = 0xf211_58c6;
+const INPUT_USER_LAYER132: u32 = 0xd829_2816;
+const INPUT_USER_FROM_MESSAGE: u32 = 0x1da4_48e2;
+
+const INPUT_PEER_EMPTY: u32 = 0x7f3b_18ea;
+const INPUT_PEER_SELF: u32 = 0x7da0_7ec9;
+const INPUT_PEER_CHAT: u32 = 0x35a9_5cb9;
+const INPUT_PEER_CHAT_LAYER131: u32 = 0x179b_e863;
+const INPUT_PEER_USER: u32 = 0xdde8_a54c;
+const INPUT_PEER_USER_LAYER131: u32 = 0x7b8e_7de6;
+const INPUT_PEER_CHANNEL: u32 = 0x27bc_bbfc;
+const INPUT_PEER_CHANNEL_LAYER131: u32 = 0x20ad_aef8;
+const INPUT_PEER_USER_FROM_MESSAGE: u32 = 0xa87b_0a1c;
+const INPUT_PEER_CHANNEL_FROM_MESSAGE: u32 = 0xbd2a_0840;
+
+const PEER_USER: u32 = 0x5951_1722;
+const PEER_CHAT: u32 = 0x36c6_019a;
+const PEER_CHANNEL: u32 = 0xa2a5_371e;
 
 const USERS_GET_USERS: u32 = 0x0d91_a548;
+const USERS_GET_FULL_USER: u32 = 0xb60f_5918;
+const USERS_USER_FULL: u32 = 0x3b6d_152e;
+const USER_FULL: u32 = 0x7fe7_38c4;
+const PEER_SETTINGS: u32 = 0xf477_41f7;
+const PEER_NOTIFY_SETTINGS: u32 = 0x9962_2c0c;
+
 const ACCOUNT_UPDATE_STATUS: u32 = 0x6628_562c;
 const ACCOUNT_REGISTER_DEVICE: u32 = 0xec86_017a;
 const ACCOUNT_UNREGISTER_DEVICE: u32 = 0x6a0d_3206;
 const ACCOUNT_UPDATE_NOTIFY_SETTINGS: u32 = 0x84be_5b93;
+const ACCOUNT_GET_NOTIFY_SETTINGS: u32 = 0x12b3_ad31;
+const ACCOUNT_RESET_NOTIFY_SETTINGS: u32 = 0xdb7e_1747;
+const ACCOUNT_GET_PASSWORD: u32 = 0x548a_30f5;
+const ACCOUNT_PASSWORD: u32 = 0x957b_50fb;
+const PASSWORD_KDF_ALGO_MODPOW: u32 = 0x3a91_2d4a;
+const SECURE_PASSWORD_KDF_ALGO_PBKDF2: u32 = 0xbbf2_dda0;
+const ACCOUNT_GET_PRIVACY: u32 = 0xdadb_c950;
+const ACCOUNT_SET_PRIVACY: u32 = 0xc9f8_1ce8;
+const ACCOUNT_PRIVACY_RULES: u32 = 0x50a0_4e45;
+const ACCOUNT_GET_GLOBAL_PRIVACY_SETTINGS: u32 = 0xeb2b_4cf6;
+const ACCOUNT_SET_GLOBAL_PRIVACY_SETTINGS: u32 = 0x1eda_aac2;
+const GLOBAL_PRIVACY_SETTINGS: u32 = 0xfe41_b34f;
+const ACCOUNT_GET_CONTENT_SETTINGS: u32 = 0x8b9b_4dae;
+const ACCOUNT_CONTENT_SETTINGS: u32 = 0x57e2_8221;
+const ACCOUNT_GET_CONTACT_SIGN_UP_NOTIFICATION: u32 = 0x9f07_c728;
+const ACCOUNT_SET_CONTACT_SIGN_UP_NOTIFICATION: u32 = 0xcff4_3f61;
+const ACCOUNT_GET_AUTHORIZATIONS: u32 = 0xe320_c158;
+const ACCOUNT_AUTHORIZATIONS: u32 = 0x4bff_8ea0;
+
 const CONTACTS_GET_CONTACTS: u32 = 0x5dd6_9e12;
 const CONTACTS_CONTACTS_NOT_MODIFIED: u32 = 0xb74b_a9d2;
+const CONTACTS_GET_STATUSES: u32 = 0xc4a3_53ee;
+const CONTACTS_GET_TOP_PEERS: u32 = 0x9734_78b6;
+const CONTACTS_TOP_PEERS_NOT_MODIFIED: u32 = 0xde26_6ef5;
+
+const PAYMENTS_GET_SAVED_STAR_GIFTS: u32 = 0xa319_e569;
+const PAYMENTS_SAVED_STAR_GIFTS: u32 = 0x95f3_89b1;
+const PAYMENTS_GET_STARS_STATUS: u32 = 0x4ea9_b3bf;
+const PAYMENTS_STARS_STATUS: u32 = 0x6c9c_e8ed;
+const STARS_AMOUNT: u32 = 0xbbb6_b4a3;
+
+const STORIES_GET_ALL_STORIES: u32 = 0xeeb0_d625;
+const STORIES_ALL_STORIES_NOT_MODIFIED: u32 = 0x1158_fe3e;
+const STORIES_STEALTH_MODE: u32 = 0x712e_27fd;
+const STORIES_GET_PEER_STORIES: u32 = 0x2c4a_da50;
+const STORIES_PEER_STORIES: u32 = 0xcae6_8768;
+const PEER_STORIES: u32 = 0x9a35_e999;
 
 /// Per-connection state threaded through dispatch.
 #[derive(Default)]
@@ -253,6 +364,22 @@ impl Dispatcher {
         let Ok(id) = r.read_u32() else {
             return vec![];
         };
+
+        if id == GZIP_PACKED {
+            let Ok(packed) = r.read_bytes() else {
+                return vec![Outbound::content(rpc_result(
+                    msg_id,
+                    &rpc_error(400, "GZIP_MALFORMED"),
+                ))];
+            };
+            let Ok(unpacked) = gunzip_bounded(packed) else {
+                return vec![Outbound::content(rpc_result(
+                    msg_id,
+                    &rpc_error(400, "GZIP_INVALID"),
+                ))];
+            };
+            return self.handle_message_ex(ctx, msg_id, &unpacked);
+        }
 
         if id == MSG_CONTAINER {
             return self.handle_container(ctx, &mut r);
@@ -387,19 +514,57 @@ impl Dispatcher {
             MESSAGES_GET_DIALOG_FILTERS | MESSAGES_GET_DIALOG_FILTERS_LEGACY => {
                 messages_dialog_filters_empty()
             }
-            MESSAGES_GET_ALL_STICKERS => empty_ctor(MESSAGES_ALL_STICKERS_NOT_MODIFIED),
+            MESSAGES_GET_SUGGESTED_DIALOG_FILTERS => empty_vector(),
+            MESSAGES_UPDATE_DIALOG_FILTER => bool_result(true),
+            MESSAGES_GET_ALL_STICKERS
+            | MESSAGES_GET_EMOJI_STICKERS
+            | MESSAGES_GET_MASK_STICKERS => messages_all_stickers(r),
+            MESSAGES_GET_FEATURED_STICKERS | MESSAGES_GET_FEATURED_EMOJI_STICKERS => {
+                messages_featured_stickers(r)
+            }
+            MESSAGES_READ_FEATURED_STICKERS => bool_result(true),
+            MESSAGES_GET_ARCHIVED_STICKERS => messages_archived_stickers(),
+            MESSAGES_GET_STICKER_SET => messages_get_sticker_set(r),
             MESSAGES_GET_RECENT_STICKERS => empty_ctor(MESSAGES_RECENT_STICKERS_NOT_MODIFIED),
             MESSAGES_GET_FAVED_STICKERS => empty_ctor(MESSAGES_FAVED_STICKERS_NOT_MODIFIED),
+            MESSAGES_GET_SAVED_GIFS => messages_saved_gifs(r),
             MESSAGES_GET_AVAILABLE_REACTIONS => {
                 empty_ctor(MESSAGES_AVAILABLE_REACTIONS_NOT_MODIFIED)
             }
+            MESSAGES_GET_SEARCH_COUNTERS => messages_get_search_counters(r),
+            MESSAGES_GET_SEARCH_RESULTS_POSITIONS => messages_search_results_positions(),
+            MESSAGES_GET_ATTACH_MENU_BOTS => messages_attach_menu_bots(r),
+            MESSAGES_GET_DEFAULT_HISTORY_TTL => default_history_ttl(),
+            HELP_DISMISS_SUGGESTION => bool_result(true),
 
-            USERS_GET_USERS => users_get_users(ctx),
+            USERS_GET_USERS => self.users_get_users(ctx, r),
+            USERS_GET_FULL_USER => self.users_get_full_user(ctx, r),
+
             ACCOUNT_UPDATE_STATUS
             | ACCOUNT_REGISTER_DEVICE
             | ACCOUNT_UNREGISTER_DEVICE
-            | ACCOUNT_UPDATE_NOTIFY_SETTINGS => bool_result(true),
+            | ACCOUNT_UPDATE_NOTIFY_SETTINGS
+            | ACCOUNT_RESET_NOTIFY_SETTINGS
+            | ACCOUNT_GET_CONTACT_SIGN_UP_NOTIFICATION
+            | ACCOUNT_SET_CONTACT_SIGN_UP_NOTIFICATION => bool_result(true),
+            ACCOUNT_GET_NOTIFY_SETTINGS => peer_notify_settings_default(),
+            ACCOUNT_GET_PASSWORD => account_get_password(),
+            ACCOUNT_GET_PRIVACY | ACCOUNT_SET_PRIVACY => account_privacy_rules_empty(),
+            ACCOUNT_GET_GLOBAL_PRIVACY_SETTINGS | ACCOUNT_SET_GLOBAL_PRIVACY_SETTINGS => {
+                global_privacy_settings_default()
+            }
+            ACCOUNT_GET_CONTENT_SETTINGS => account_content_settings_default(),
+            ACCOUNT_GET_AUTHORIZATIONS => account_authorizations_empty(),
+
             CONTACTS_GET_CONTACTS => empty_ctor(CONTACTS_CONTACTS_NOT_MODIFIED),
+            CONTACTS_GET_STATUSES => empty_vector(),
+            CONTACTS_GET_TOP_PEERS => empty_ctor(CONTACTS_TOP_PEERS_NOT_MODIFIED),
+
+            PAYMENTS_GET_SAVED_STAR_GIFTS => payments_saved_star_gifts_empty(),
+            PAYMENTS_GET_STARS_STATUS => payments_stars_status_empty(),
+
+            STORIES_GET_ALL_STORIES => stories_all_stories_not_modified(),
+            STORIES_GET_PEER_STORIES => self.stories_peer_stories_empty(ctx, r),
 
             other => {
                 eprintln!("[core] unknown rpc {other:#010x} (key={:#018x})", ctx.auth_key_id);
@@ -650,6 +815,118 @@ impl Dispatcher {
             }
         }
     }
+
+    fn resolve_input_user(&self, ctx: &ConnContext, r: &mut Reader) -> Result<Option<User>, TlError> {
+        let ctor = r.read_u32()?;
+        match ctor {
+            INPUT_USER_EMPTY => Ok(None),
+            INPUT_USER_SELF => Ok(ctx.user.clone()),
+            INPUT_USER => {
+                let uid = r.read_i64()?;
+                let _access_hash = r.read_i64()?;
+                if ctx.user.as_ref().map(|u| u.id) == Some(uid) {
+                    Ok(ctx.user.clone())
+                } else {
+                    Ok(self.store.user_by_id(uid))
+                }
+            }
+            INPUT_USER_LAYER132 => {
+                let uid = r.read_i32()? as i64;
+                let _access_hash = r.read_i64()?;
+                Ok(self.store.user_by_id(uid))
+            }
+            INPUT_USER_FROM_MESSAGE => {
+                let _ = read_input_peer(r, ctx.user.as_ref().map(|u| u.id))?;
+                let _msg_id = r.read_i32()?;
+                let uid = r.read_i64()?;
+                Ok(self.store.user_by_id(uid))
+            }
+            other => Err(TlError::UnknownConstructor {
+                id: other,
+                context: "InputUser",
+            }),
+        }
+    }
+
+    /// `users.getUsers#0d91a548 id:Vector<InputUser> = Vector<User>`
+    fn users_get_users(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let self_id = ctx.user.as_ref().map(|u| u.id);
+        let Ok(count) = r.read_vector_header() else {
+            let mut w = Writer::new();
+            if let Some(u) = &ctx.user {
+                w.write_vector_header(1);
+                w.write_raw(&encode_user_for_viewer(u, self_id));
+            } else {
+                w.write_vector_header(0);
+            }
+            return w.into_vec();
+        };
+        let mut found = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            match self.resolve_input_user(ctx, r) {
+                Ok(Some(u)) => found.push(u),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        let mut w = Writer::new();
+        w.write_vector_header(found.len());
+        for u in &found {
+            w.write_raw(&encode_user_for_viewer(u, self_id));
+        }
+        w.into_vec()
+    }
+
+    /// `users.getFullUser#b60f5918 id:InputUser = users.UserFull`
+    fn users_get_full_user(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let target = match self.resolve_input_user(ctx, r) {
+            Ok(Some(u)) => u,
+            Ok(None) => match &ctx.user {
+                Some(u) => u.clone(),
+                None => return rpc_error(400, "USER_ID_INVALID"),
+            },
+            Err(_) => return rpc_error(400, "USER_ID_INVALID"),
+        };
+        let self_id = ctx.user.as_ref().map(|u| u.id);
+
+        let mut w = Writer::new();
+        w.write_u32(USERS_USER_FULL);
+        // TL_userFull#7fe738c4
+        w.write_u32(USER_FULL);
+        let full_flags = (1 << 4) | (1 << 7) | (1 << 13); // phone_calls_available | can_pin_message | video_calls_available
+        w.write_i32(full_flags);
+        w.write_i32(0); // flags2
+        w.write_i64(target.id);
+        // PeerSettings#f47741f7
+        w.write_u32(PEER_SETTINGS);
+        w.write_i32(0);
+        // PeerNotifySettings#99622c0c
+        w.write_u32(PEER_NOTIFY_SETTINGS);
+        w.write_i32(0);
+        w.write_i32(0); // common_chats_count
+        w.write_vector_header(0); // chats
+        w.write_vector_header(1); // users
+        w.write_raw(&encode_user_for_viewer(&target, self_id));
+        w.into_vec()
+    }
+
+    /// `stories.getPeerStories#2c4ada50 peer:InputPeer = stories.PeerStories`
+    fn stories_peer_stories_empty(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let self_id = ctx.user.as_ref().map(|u| u.id);
+        let peer_bytes = match read_input_peer(r, self_id) {
+            Ok(Some(pb)) => pb,
+            _ => encode_peer_user(self_id.unwrap_or(0)),
+        };
+        let mut w = Writer::new();
+        w.write_u32(STORIES_PEER_STORIES);
+        w.write_u32(PEER_STORIES);
+        w.write_i32(0); // flags
+        w.write_raw(&peer_bytes);
+        w.write_vector_header(0); // stories
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
 }
 
 fn encode_sent_code(hash: &str) -> Vec<u8> {
@@ -840,16 +1117,415 @@ fn messages_dialog_filters_empty() -> Vec<u8> {
     w.into_vec()
 }
 
-/// `users.getUsers` -> `Vector<User>` containing the logged-in user (if any).
-fn users_get_users(ctx: &ConnContext) -> Vec<u8> {
-    let mut w = Writer::new();
-    match &ctx.user {
-        Some(user) => {
-            w.write_vector_header(1);
-            w.write_raw(&encode_user(user));
-        }
-        None => w.write_vector_header(0),
+fn gunzip_bounded(packed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut dec = GzDecoder::new(packed).take((MAX_GZIP_UNPACKED_LEN + 1) as u64);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)?;
+    if out.len() > MAX_GZIP_UNPACKED_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "gzip payload exceeds limit",
+        ));
     }
+    Ok(out)
+}
+
+fn encode_peer_user(uid: i64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(PEER_USER);
+    w.write_i64(uid);
+    w.into_vec()
+}
+
+fn read_input_peer(r: &mut Reader, self_id: Option<i64>) -> Result<Option<Vec<u8>>, TlError> {
+    let ctor = r.read_u32()?;
+    match ctor {
+        INPUT_PEER_EMPTY => Ok(None),
+        INPUT_PEER_SELF => Ok(Some(encode_peer_user(self_id.unwrap_or(0)))),
+        INPUT_PEER_USER => {
+            let uid = r.read_i64()?;
+            let _access_hash = r.read_i64()?;
+            Ok(Some(encode_peer_user(uid)))
+        }
+        INPUT_PEER_USER_LAYER131 => {
+            let uid = r.read_i32()? as i64;
+            let _access_hash = r.read_i64()?;
+            Ok(Some(encode_peer_user(uid)))
+        }
+        INPUT_PEER_CHAT => {
+            let chat_id = r.read_i64()?;
+            let mut w = Writer::new();
+            w.write_u32(PEER_CHAT);
+            w.write_i64(chat_id);
+            Ok(Some(w.into_vec()))
+        }
+        INPUT_PEER_CHAT_LAYER131 => {
+            let chat_id = r.read_i32()? as i64;
+            let mut w = Writer::new();
+            w.write_u32(PEER_CHAT);
+            w.write_i64(chat_id);
+            Ok(Some(w.into_vec()))
+        }
+        INPUT_PEER_CHANNEL => {
+            let channel_id = r.read_i64()?;
+            let _access_hash = r.read_i64()?;
+            let mut w = Writer::new();
+            w.write_u32(PEER_CHANNEL);
+            w.write_i64(channel_id);
+            Ok(Some(w.into_vec()))
+        }
+        INPUT_PEER_CHANNEL_LAYER131 => {
+            let channel_id = r.read_i32()? as i64;
+            let _access_hash = r.read_i64()?;
+            let mut w = Writer::new();
+            w.write_u32(PEER_CHANNEL);
+            w.write_i64(channel_id);
+            Ok(Some(w.into_vec()))
+        }
+        INPUT_PEER_USER_FROM_MESSAGE => {
+            let _ = read_input_peer(r, self_id)?;
+            let _msg_id = r.read_i32()?;
+            let uid = r.read_i64()?;
+            Ok(Some(encode_peer_user(uid)))
+        }
+        INPUT_PEER_CHANNEL_FROM_MESSAGE => {
+            let _ = read_input_peer(r, self_id)?;
+            let _msg_id = r.read_i32()?;
+            let channel_id = r.read_i64()?;
+            let mut w = Writer::new();
+            w.write_u32(PEER_CHANNEL);
+            w.write_i64(channel_id);
+            Ok(Some(w.into_vec()))
+        }
+        other => Err(TlError::UnknownConstructor {
+            id: other,
+            context: "InputPeer",
+        }),
+    }
+}
+
+/// `messages.getAllStickers` / `getEmojiStickers` / `getMaskStickers`
+fn messages_all_stickers(r: &mut Reader) -> Vec<u8> {
+    let hash = r.read_i64().unwrap_or(0);
+    if hash == 1 {
+        return empty_ctor(MESSAGES_ALL_STICKERS_NOT_MODIFIED);
+    }
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_ALL_STICKERS);
+    w.write_i64(1); // hash
+    w.write_vector_header(0); // sets
+    w.into_vec()
+}
+
+/// `messages.getFeaturedStickers` / `getFeaturedEmojiStickers`
+fn messages_featured_stickers(r: &mut Reader) -> Vec<u8> {
+    let hash = r.read_i64().unwrap_or(0);
+    if hash == 1 {
+        let mut w = Writer::new();
+        w.write_u32(MESSAGES_FEATURED_STICKERS_NOT_MODIFIED);
+        w.write_i32(0); // count
+        return w.into_vec();
+    }
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_FEATURED_STICKERS);
+    w.write_i32(0); // flags
+    w.write_i64(1); // hash
+    w.write_i32(0); // count
+    w.write_vector_header(0); // sets
+    w.write_vector_header(0); // unread
+    w.into_vec()
+}
+
+/// `messages.getArchivedStickers` -> `TL_messages_archivedStickers#4fcba9c8`
+fn messages_archived_stickers() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_ARCHIVED_STICKERS);
+    w.write_i32(0); // count
+    w.write_vector_header(0); // sets
+    w.into_vec()
+}
+
+fn encode_empty_sticker_set(id: i64, short_name: &str, title: &str, is_emojis: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_STICKER_SET);
+    w.write_u32(STICKER_SET);
+    let mut flags = 1 << 2; // official
+    if is_emojis {
+        flags |= 1 << 7; // emojis
+    }
+    w.write_i32(flags);
+    w.write_i64(id);
+    w.write_i64(id.wrapping_mul(0x517c_c1b7_2722_0a95));
+    w.write_string(title);
+    w.write_string(short_name);
+    w.write_i32(0); // count
+    w.write_i32(1); // hash
+    w.write_vector_header(0); // packs
+    w.write_vector_header(0); // keywords
+    w.write_vector_header(0); // documents
+    w.into_vec()
+}
+
+/// `messages.getStickerSet#c8a0ec74 stickerset:InputStickerSet hash:int = messages.StickerSet`
+/// Never returns `TL_messages_stickerSetNotModified` when `set` fields are accessed
+/// (`TL_messages_stickerSetNotModified` subclasses `TL_messages_stickerSet` in Java with `set == null`!).
+fn messages_get_sticker_set(r: &mut Reader) -> Vec<u8> {
+    let Ok(ctor) = r.read_u32() else {
+        return rpc_error(400, "STICKERSET_INVALID");
+    };
+    match ctor {
+        INPUT_STICKER_SET_ANIMATED_EMOJI => {
+            encode_empty_sticker_set(1001, "AnimatedEmoji", "Animated Emoji", true)
+        }
+        INPUT_STICKER_SET_EMOJI_GENERIC_ANIMATIONS => {
+            encode_empty_sticker_set(1002, "EmojiAnimations", "Emoji Animations", false)
+        }
+        INPUT_STICKER_SET_EMOJI_DEFAULT_TOPIC_ICONS => {
+            encode_empty_sticker_set(1003, "TopicIcons", "Topic Icons", true)
+        }
+        INPUT_STICKER_SET_PREMIUM_GIFTS => {
+            encode_empty_sticker_set(1004, "PremiumGifts", "Premium Gifts", false)
+        }
+        INPUT_STICKER_SET_TON_GIFTS => encode_empty_sticker_set(1005, "TonGifts", "Gifts", false),
+        INPUT_STICKER_SET_EMOJI_DEFAULT_STATUSES => {
+            encode_empty_sticker_set(1006, "DefaultStatuses", "Statuses", true)
+        }
+        INPUT_STICKER_SET_EMOJI_CHANNEL_DEFAULT_STATUSES => {
+            encode_empty_sticker_set(1007, "ChannelStatuses", "Channel Statuses", true)
+        }
+        INPUT_STICKER_SET_DICE => {
+            let emoticon = r.read_string().unwrap_or("🎲");
+            encode_empty_sticker_set(1008, "Dice", emoticon, false)
+        }
+        INPUT_STICKER_SET_DICE_LAYER111 => encode_empty_sticker_set(1008, "Dice", "Dice", false),
+        INPUT_STICKER_SET_SHORT_NAME => {
+            let name = r.read_string().unwrap_or("");
+            match name {
+                "AnimatedEmoji" => {
+                    encode_empty_sticker_set(1001, "AnimatedEmoji", "Animated Emoji", true)
+                }
+                "EmojiAnimations" => {
+                    encode_empty_sticker_set(1002, "EmojiAnimations", "Emoji Animations", false)
+                }
+                "TopicIcons" => encode_empty_sticker_set(1003, "TopicIcons", "Topic Icons", true),
+                "PremiumGifts" => {
+                    encode_empty_sticker_set(1004, "PremiumGifts", "Premium Gifts", false)
+                }
+                "TonGifts" => encode_empty_sticker_set(1005, "TonGifts", "Gifts", false),
+                "DefaultStatuses" => {
+                    encode_empty_sticker_set(1006, "DefaultStatuses", "Statuses", true)
+                }
+                "ChannelStatuses" => {
+                    encode_empty_sticker_set(1007, "ChannelStatuses", "Channel Statuses", true)
+                }
+                "Dice" | "android_elli" => encode_empty_sticker_set(1008, name, name, false),
+                _ => rpc_error(400, "STICKERSET_INVALID"),
+            }
+        }
+        INPUT_STICKER_SET_ID => {
+            let id = r.read_i64().unwrap_or(0);
+            let _access_hash = r.read_i64();
+            match id {
+                1001 => encode_empty_sticker_set(1001, "AnimatedEmoji", "Animated Emoji", true),
+                1002 => {
+                    encode_empty_sticker_set(1002, "EmojiAnimations", "Emoji Animations", false)
+                }
+                1003 => encode_empty_sticker_set(1003, "TopicIcons", "Topic Icons", true),
+                1004 => encode_empty_sticker_set(1004, "PremiumGifts", "Premium Gifts", false),
+                1005 => encode_empty_sticker_set(1005, "TonGifts", "Gifts", false),
+                1006 => encode_empty_sticker_set(1006, "DefaultStatuses", "Statuses", true),
+                1007 => {
+                    encode_empty_sticker_set(1007, "ChannelStatuses", "Channel Statuses", true)
+                }
+                1008 => encode_empty_sticker_set(1008, "Dice", "Dice", false),
+                _ => rpc_error(400, "STICKERSET_INVALID"),
+            }
+        }
+        INPUT_STICKER_SET_EMPTY => rpc_error(400, "STICKERSET_INVALID"),
+        _ => rpc_error(400, "STICKERSET_INVALID"),
+    }
+}
+
+fn messages_saved_gifs(r: &mut Reader) -> Vec<u8> {
+    let hash = r.read_i64().unwrap_or(0);
+    if hash == 1 {
+        return empty_ctor(MESSAGES_SAVED_GIFS_NOT_MODIFIED);
+    }
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_SAVED_GIFS);
+    w.write_i64(1); // hash
+    w.write_vector_header(0); // gifs
+    w.into_vec()
+}
+
+/// `messages.getSearchCounters#1bbcf300` -> `Vector<messages.SearchCounter#e844ebff>`
+fn messages_get_search_counters(r: &mut Reader) -> Vec<u8> {
+    let Ok(flags) = r.read_i32() else {
+        return empty_vector();
+    };
+    if read_input_peer(r, None).is_err() {
+        return empty_vector();
+    }
+    if flags & (1 << 2) != 0 && read_input_peer(r, None).is_err() {
+        return empty_vector();
+    }
+    if flags & 1 != 0 && r.read_i32().is_err() {
+        return empty_vector();
+    }
+    let Ok(count) = r.read_vector_header() else {
+        return empty_vector();
+    };
+    let mut filters: Vec<(u32, Option<i32>)> = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Ok(f_ctor) = r.read_u32() else {
+            break;
+        };
+        let extra = if f_ctor == INPUT_MESSAGES_FILTER_PHONE_CALLS {
+            Some(r.read_i32().unwrap_or(0))
+        } else {
+            None
+        };
+        filters.push((f_ctor, extra));
+    }
+    let mut w = Writer::new();
+    w.write_vector_header(filters.len());
+    for (f_ctor, extra) in filters {
+        w.write_u32(MESSAGES_SEARCH_COUNTER);
+        w.write_i32(0); // flags
+        w.write_u32(f_ctor);
+        if let Some(f_flags) = extra {
+            w.write_i32(f_flags);
+        }
+        w.write_i32(0); // count
+    }
+    w.into_vec()
+}
+
+fn messages_search_results_positions() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_SEARCH_RESULTS_POSITIONS);
+    w.write_i32(0); // count
+    w.write_vector_header(0); // positions
+    w.into_vec()
+}
+
+fn messages_attach_menu_bots(r: &mut Reader) -> Vec<u8> {
+    let hash = r.read_i64().unwrap_or(0);
+    if hash == 1 {
+        return empty_ctor(ATTACH_MENU_BOTS_NOT_MODIFIED);
+    }
+    let mut w = Writer::new();
+    w.write_u32(ATTACH_MENU_BOTS);
+    w.write_i64(1); // hash
+    w.write_vector_header(0); // bots
+    w.write_vector_header(0); // users
+    w.into_vec()
+}
+
+fn default_history_ttl() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(DEFAULT_HISTORY_TTL);
+    w.write_i32(0); // period
+    w.into_vec()
+}
+
+fn peer_notify_settings_default() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(PEER_NOTIFY_SETTINGS);
+    w.write_i32(0); // flags
+    w.into_vec()
+}
+
+/// `account.getPassword#548a30f5 = account.Password#957b50fb`
+fn account_get_password() -> Vec<u8> {
+    let dh_params = dh::server_default();
+    let mut rng = rand::thread_rng();
+    let mut salt1 = [0u8; 8];
+    let mut salt2 = [0u8; 16];
+    let mut sec_salt = [0u8; 8];
+    let mut secure_random = [0u8; 32];
+    rng.fill_bytes(&mut salt1);
+    rng.fill_bytes(&mut salt2);
+    rng.fill_bytes(&mut sec_salt);
+    rng.fill_bytes(&mut secure_random);
+
+    let mut w = Writer::new();
+    w.write_u32(ACCOUNT_PASSWORD);
+    w.write_i32(0); // flags (has_password = false)
+    // new_algo: TL_passwordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow#3a912d4a
+    w.write_u32(PASSWORD_KDF_ALGO_MODPOW);
+    w.write_bytes(&salt1);
+    w.write_bytes(&salt2);
+    w.write_i32(dh_params.g as i32);
+    w.write_bytes(&dh_params.prime_be());
+    // new_secure_algo: TL_securePasswordKdfAlgoPBKDF2HMACSHA512iter100000#bbf2dda0
+    w.write_u32(SECURE_PASSWORD_KDF_ALGO_PBKDF2);
+    w.write_bytes(&sec_salt);
+    w.write_bytes(&secure_random);
+    w.into_vec()
+}
+
+fn account_privacy_rules_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(ACCOUNT_PRIVACY_RULES);
+    w.write_vector_header(0); // rules
+    w.write_vector_header(0); // chats
+    w.write_vector_header(0); // users
+    w.into_vec()
+}
+
+fn global_privacy_settings_default() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(GLOBAL_PRIVACY_SETTINGS);
+    w.write_i32(0); // flags
+    w.into_vec()
+}
+
+fn account_content_settings_default() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(ACCOUNT_CONTENT_SETTINGS);
+    w.write_i32(0); // flags
+    w.into_vec()
+}
+
+fn account_authorizations_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(ACCOUNT_AUTHORIZATIONS);
+    w.write_i32(180); // authorization_ttl_days
+    w.write_vector_header(0); // authorizations
+    w.into_vec()
+}
+
+fn payments_saved_star_gifts_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(PAYMENTS_SAVED_STAR_GIFTS);
+    w.write_i32(0); // flags
+    w.write_i32(0); // count
+    w.write_vector_header(0); // gifts
+    w.write_vector_header(0); // chats
+    w.write_vector_header(0); // users
+    w.into_vec()
+}
+
+fn payments_stars_status_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(PAYMENTS_STARS_STATUS);
+    w.write_i32(0); // flags
+    w.write_u32(STARS_AMOUNT);
+    w.write_i64(0); // amount
+    w.write_i32(0); // nanos
+    w.write_vector_header(0); // chats
+    w.write_vector_header(0); // users
+    w.into_vec()
+}
+
+fn stories_all_stories_not_modified() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(STORIES_ALL_STORIES_NOT_MODIFIED);
+    w.write_i32(0); // flags
+    w.write_string("0"); // state
+    w.write_u32(STORIES_STEALTH_MODE);
+    w.write_i32(0); // stealth flags
     w.into_vec()
 }
 
@@ -946,6 +1622,13 @@ fn peel_wrappers(mut id: u32, r: &mut Reader) -> Result<Vec<u8>, TlError> {
             }
             INVOKE_WITH_RECAPTCHA => {
                 let _token = r.read_string()?;
+            }
+            GZIP_PACKED => {
+                let packed = r.read_bytes()?;
+                let unpacked = gunzip_bounded(packed).map_err(|_| TlError::InvalidPadding)?;
+                let mut ur = Reader::new(&unpacked);
+                let inner_id = ur.read_u32()?;
+                return peel_wrappers(inner_id, &mut ur);
             }
             INIT_CONNECTION => {
                 let flags = r.read_i32()?;
@@ -1059,17 +1742,24 @@ fn authorization(user: &User) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Encode `TL_user#b1b8cc83`.
-/// Sets `FLAG_10` (`self = true`, pure bitflag with zero extra wire bytes) plus
-/// `FLAG_0` (`access_hash`), `FLAG_1` (`first_name`), and `FLAG_4` (`phone`).
+/// Encode `TL_user#b1b8cc83` for the authenticated user (`self = true`).
 fn encode_user(user: &User) -> Vec<u8> {
+    encode_user_for_viewer(user, Some(user.id))
+}
+
+/// Encode `TL_user#b1b8cc83`, setting `FLAG_10` (`self`) only when `user.id`
+/// matches the viewer's `self_id`.
+fn encode_user_for_viewer(user: &User, self_id: Option<i64>) -> Vec<u8> {
     const FLAG_0: i32 = 1 << 0; // access_hash
     const FLAG_1: i32 = 1 << 1; // first_name
     const FLAG_2: i32 = 1 << 2; // last_name
     const FLAG_4: i32 = 1 << 4; // phone
     const FLAG_10: i32 = 1 << 10; // self (bitflag only, no extra bytes)
     let include_last = !user.last_name.is_empty() && user.last_name != "User";
-    let mut flags = FLAG_0 | FLAG_1 | FLAG_4 | FLAG_10;
+    let mut flags = FLAG_0 | FLAG_1 | FLAG_4;
+    if Some(user.id) == self_id {
+        flags |= FLAG_10;
+    }
     if include_last {
         flags |= FLAG_2;
     }
@@ -1651,5 +2341,137 @@ mod tests {
         assert_eq!(req, client_msg_id);
         let hash = decode_sent_code(&result);
         assert!(!hash.is_empty(), "got a phone_code_hash over the encrypted session");
+    }
+
+    #[test]
+    fn post_login_rpcs_and_gzip_packed_work() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let store = Arc::new(Store::with_test_code(Some("12345".into())));
+        let d = Dispatcher::new(store.clone());
+
+        let alice = store.sign_up("88888888888", "h1", "Alice", "").unwrap();
+        let bob = store.sign_up("88888888889", "h2", "Bob", "Builder").unwrap();
+
+        let mut ctx = ConnContext {
+            user: Some(alice.clone()),
+            auth_key_id: 0x1111,
+            session_id: 0x2222,
+            server_salt: 0x3333,
+        };
+
+        // 1. users.getUsers with [inputUserSelf, inputUser(bob)] -> self flag set ONLY on alice!
+        let mut gu = Writer::new();
+        gu.write_u32(USERS_GET_USERS);
+        gu.write_vector_header(2);
+        gu.write_u32(INPUT_USER_SELF);
+        gu.write_u32(INPUT_USER);
+        gu.write_i64(bob.id);
+        gu.write_i64(bob.access_hash);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 100, &gu.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_vector_header().unwrap(), 2);
+        assert_eq!(r.read_u32().unwrap(), USER);
+        let alice_flags = r.read_i32().unwrap();
+        assert_ne!(alice_flags & (1 << 10), 0, "viewer must have self flag");
+        // Find Bob's constructor in remaining bytes:
+        let rest = r.read_raw(r.remaining()).unwrap();
+        let bob_pos = rest
+            .windows(4)
+            .position(|w| w == USER.to_le_bytes())
+            .expect("second TL_user present");
+        let bob_flags = i32::from_le_bytes(rest[bob_pos + 4..bob_pos + 8].try_into().unwrap());
+        assert_eq!(bob_flags & (1 << 10), 0, "other user must NOT have self flag");
+
+        // 2. users.getFullUser(inputUserSelf)
+        let mut gfu = Writer::new();
+        gfu.write_u32(USERS_GET_FULL_USER);
+        gfu.write_u32(INPUT_USER_SELF);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 101, &gfu.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), USERS_USER_FULL);
+        assert_eq!(r.read_u32().unwrap(), USER_FULL);
+
+        // 3. messages.getStickerSet(AnimatedEmoji) -> full TL_messages_stickerSet#6e153f16
+        let mut gss = Writer::new();
+        gss.write_u32(MESSAGES_GET_STICKER_SET);
+        gss.write_u32(INPUT_STICKER_SET_ANIMATED_EMOJI);
+        gss.write_i32(0);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 102, &gss.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), MESSAGES_STICKER_SET);
+        assert_eq!(r.read_u32().unwrap(), STICKER_SET);
+
+        // Unknown custom stickerset -> STICKERSET_INVALID
+        let mut gss_bad = Writer::new();
+        gss_bad.write_u32(MESSAGES_GET_STICKER_SET);
+        gss_bad.write_u32(INPUT_STICKER_SET_SHORT_NAME);
+        gss_bad.write_string("nonexistent_custom_pack");
+        gss_bad.write_i32(0);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 103, &gss_bad.into_vec())[0]);
+        let mut er = Reader::new(&res);
+        assert_eq!(er.read_u32().unwrap(), RPC_ERROR);
+        assert_eq!(er.read_i32().unwrap(), 400);
+        assert_eq!(er.read_string().unwrap(), "STICKERSET_INVALID");
+
+        // 4. Featured / Emoji / Archived stickers hash transitions
+        let mut gfs = Writer::new();
+        gfs.write_u32(MESSAGES_GET_FEATURED_STICKERS);
+        gfs.write_i64(0);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 104, &gfs.into_vec())[0]);
+        assert_eq!(
+            u32::from_le_bytes(res[0..4].try_into().unwrap()),
+            MESSAGES_FEATURED_STICKERS
+        );
+        let mut gfs2 = Writer::new();
+        gfs2.write_u32(MESSAGES_GET_FEATURED_STICKERS);
+        gfs2.write_i64(1);
+        let (_, res2) = unwrap_rpc_result(&d.handle_message(&mut ctx, 105, &gfs2.into_vec())[0]);
+        assert_eq!(
+            u32::from_le_bytes(res2[0..4].try_into().unwrap()),
+            MESSAGES_FEATURED_STICKERS_NOT_MODIFIED
+        );
+
+        // 5. account.getPassword -> TL_account.TL_password#957b50fb
+        let mut gp = Writer::new();
+        gp.write_u32(ACCOUNT_GET_PASSWORD);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 106, &gp.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), ACCOUNT_PASSWORD);
+        assert_eq!(r.read_i32().unwrap(), 0);
+        assert_eq!(r.read_u32().unwrap(), PASSWORD_KDF_ALGO_MODPOW);
+
+        // 6. messages.getSearchCounters -> Vector<messages.SearchCounter#e844ebff>
+        let mut gsc = Writer::new();
+        gsc.write_u32(MESSAGES_GET_SEARCH_COUNTERS);
+        gsc.write_i32(0); // flags
+        gsc.write_u32(INPUT_PEER_SELF);
+        gsc.write_vector_header(2);
+        gsc.write_u32(0x9609a51c); // inputMessagesFilterPhotos
+        gsc.write_u32(INPUT_MESSAGES_FILTER_PHONE_CALLS);
+        gsc.write_i32(1); // missed flag
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 107, &gsc.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_vector_header().unwrap(), 2);
+        assert_eq!(r.read_u32().unwrap(), MESSAGES_SEARCH_COUNTER);
+
+        // 7. payments.getSavedStarGifts & payments.getStarsStatus wrapped in gzip_packed!
+        let mut inner = Writer::new();
+        inner.write_u32(PAYMENTS_GET_STARS_STATUS);
+        inner.write_u32(INPUT_PEER_SELF);
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&inner.into_vec()).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut gz = Writer::new();
+        gz.write_u32(GZIP_PACKED);
+        gz.write_bytes(&compressed);
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 108, &gz.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), PAYMENTS_STARS_STATUS);
+        assert_eq!(r.read_i32().unwrap(), 0);
+        assert_eq!(r.read_u32().unwrap(), STARS_AMOUNT);
     }
 }

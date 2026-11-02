@@ -13,6 +13,7 @@
 use num_bigint_dig::prime::probably_prime;
 use num_bigint_dig::BigUint;
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 use mtproto_crypto::dh::{self, DhParams};
 use mtproto_crypto::rsa_key::ServerRsaKey;
@@ -153,8 +154,11 @@ impl HandshakeServer {
         if nonce != self.nonce || server_nonce != self.server_nonce {
             return Err(HandshakeError::NonceMismatch);
         }
-        let _p = r.read_bytes()?;
-        let _q = r.read_bytes()?;
+        let p_outer = be_bytes_to_u64(r.read_bytes()?);
+        let q_outer = be_bytes_to_u64(r.read_bytes()?);
+        if p_outer >= q_outer || p_outer.saturating_mul(q_outer) != self.pq {
+            return Err(HandshakeError::PqMismatch(p_outer.saturating_mul(q_outer)));
+        }
         let fingerprint = r.read_i64()?;
         if fingerprint != self.rsa.fingerprint {
             return Err(HandshakeError::UnknownFingerprint(fingerprint));
@@ -167,13 +171,21 @@ impl HandshakeServer {
         let data = self.rsa.decrypt_pq_inner(&enc)?;
         self.parse_pq_inner(&data)?;
 
-        // Generate the server DH secret and public value.
+        // Generate the server DH secret and public value, resampling until g_a
+        // satisfies MTProto's [2^1984, p - 2^1984] safety bounds.
         let mut rng = rand::thread_rng();
-        let mut a_bytes = [0u8; 256];
-        rng.fill_bytes(&mut a_bytes);
-        self.a = BigUint::from_bytes_be(&a_bytes) % (&self.dh.prime - 1u32);
-        let g_a = self.dh.pow(&self.a);
-        self.dh.check_public(&g_a).map_err(|_| HandshakeError::DhRange)?;
+        let g_a = loop {
+            let mut a_bytes = [0u8; 256];
+            rng.fill_bytes(&mut a_bytes);
+            self.a = BigUint::from_bytes_be(&a_bytes) % (&self.dh.prime - 1u32);
+            if self.a <= BigUint::from(1u32) {
+                continue;
+            }
+            let candidate = self.dh.pow(&self.a);
+            if self.dh.check_public(&candidate).is_ok() {
+                break candidate;
+            }
+        };
 
         // server_DH_inner_data.
         let mut inner = Writer::new();
@@ -218,8 +230,8 @@ impl HandshakeServer {
             return Err(HandshakeError::UnexpectedConstructor(id));
         }
         let pq = be_bytes_to_u64(r.read_bytes()?);
-        let _p = r.read_bytes()?;
-        let _q = r.read_bytes()?;
+        let p_in = be_bytes_to_u64(r.read_bytes()?);
+        let q_in = be_bytes_to_u64(r.read_bytes()?);
         let nonce = r.read_i128()?;
         let server_nonce = r.read_i128()?;
         let new_nonce = r.read_i256()?;
@@ -239,7 +251,7 @@ impl HandshakeServer {
         if nonce != self.nonce || server_nonce != self.server_nonce {
             return Err(HandshakeError::NonceMismatch);
         }
-        if pq != self.pq {
+        if pq != self.pq || p_in >= q_in || p_in.saturating_mul(q_in) != self.pq {
             return Err(HandshakeError::PqMismatch(pq));
         }
         self.new_nonce = new_nonce;
@@ -253,6 +265,9 @@ impl HandshakeServer {
             return Err(HandshakeError::NonceMismatch);
         }
         let enc = r.read_bytes()?;
+        if enc.len() < 32 {
+            return Err(HandshakeError::IntegrityCheck);
+        }
         let mut buf = enc.to_vec();
         ige::decrypt(&self.tmp_key, &self.tmp_iv, &mut buf)?;
 
@@ -271,7 +286,7 @@ impl HandshakeServer {
             return Err(HandshakeError::NonceMismatch);
         }
         let obj_len = cr.position();
-        if sha1(&buf[20..20 + obj_len]) != embedded_sha {
+        if sha1(&buf[20..20 + obj_len]).ct_eq(&embedded_sha).unwrap_u8() != 1 {
             return Err(HandshakeError::IntegrityCheck);
         }
 

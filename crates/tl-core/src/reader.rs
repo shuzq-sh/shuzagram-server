@@ -98,10 +98,9 @@ impl<'a> Reader<'a> {
         };
         let data = self.take(len)?;
         let pad = (4 - (header + len) % 4) % 4;
-        let padding = self.take(pad)?;
-        if padding.iter().any(|&b| b != 0) {
-            return Err(TlError::InvalidPadding);
-        }
+        // Skip 0..3 alignment bytes (matches tgnet NativeByteBuffer::readByteArray,
+        // which tolerates non-zero alignment bytes from third-party/legacy clients).
+        let _ = self.take(pad)?;
         Ok(data)
     }
 
