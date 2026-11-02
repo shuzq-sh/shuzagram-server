@@ -20,10 +20,13 @@ use mtproto_crypto::{ige, kdf, sha1, sha1_parts};
 use tl_core::{Reader, TlError, Writer};
 
 // --- constructor ids --------------------------------------------------------
+const REQ_PQ: u32 = 0x6046_9778;
 const REQ_PQ_MULTI: u32 = 0xbe7e_8ef1;
 const RES_PQ: u32 = 0x0516_2463;
 const P_Q_INNER_DATA: u32 = 0x83c9_5aec;
 const P_Q_INNER_DATA_DC: u32 = 0xa9f5_5f95;
+const P_Q_INNER_DATA_TEMP: u32 = 0x3c6a_84d4;
+const P_Q_INNER_DATA_TEMP_DC: u32 = 0x56fd_df88;
 const REQ_DH_PARAMS: u32 = 0xd712_e4be;
 const SERVER_DH_PARAMS_OK: u32 = 0xd0e8_075c;
 const SERVER_DH_INNER_DATA: u32 = 0xb589_0dba;
@@ -108,11 +111,15 @@ impl HandshakeServer {
     }
 
     /// Feed the body of one inbound bare message.
+    ///
+    /// Accepts a fresh `req_pq` / `req_pq_multi` in any stage because stock
+    /// `tgnet` negotiates `perm_auth_key` and then `temp_auth_key` sequentially
+    /// over the same TCP connection.
     pub fn handle(&mut self, body: &[u8]) -> Result<Step, HandshakeError> {
         let mut r = Reader::new(body);
         let id = r.read_u32()?;
         match (self.stage, id) {
-            (Stage::AwaitReqPq, REQ_PQ_MULTI) => self.on_req_pq(&mut r),
+            (_, REQ_PQ | REQ_PQ_MULTI) => self.on_req_pq(&mut r),
             (Stage::AwaitReqDh, REQ_DH_PARAMS) => self.on_req_dh(&mut r),
             (Stage::AwaitSetClientDh, SET_CLIENT_DH_PARAMS) => self.on_set_client_dh(&mut r),
             (_, other) => Err(HandshakeError::UnexpectedConstructor(other)),
@@ -204,7 +211,10 @@ impl HandshakeServer {
     fn parse_pq_inner(&mut self, data: &[u8]) -> Result<(), HandshakeError> {
         let mut r = Reader::new(data);
         let id = r.read_u32()?;
-        if id != P_Q_INNER_DATA && id != P_Q_INNER_DATA_DC {
+        if !matches!(
+            id,
+            P_Q_INNER_DATA | P_Q_INNER_DATA_DC | P_Q_INNER_DATA_TEMP | P_Q_INNER_DATA_TEMP_DC
+        ) {
             return Err(HandshakeError::UnexpectedConstructor(id));
         }
         let pq = be_bytes_to_u64(r.read_bytes()?);
@@ -213,6 +223,19 @@ impl HandshakeServer {
         let nonce = r.read_i128()?;
         let server_nonce = r.read_i128()?;
         let new_nonce = r.read_i256()?;
+        match id {
+            P_Q_INNER_DATA_DC => {
+                let _dc = r.read_i32()?;
+            }
+            P_Q_INNER_DATA_TEMP => {
+                let _expires_in = r.read_i32()?;
+            }
+            P_Q_INNER_DATA_TEMP_DC => {
+                let _dc = r.read_i32()?;
+                let _expires_in = r.read_i32()?;
+            }
+            _ => {}
+        }
         if nonce != self.nonce || server_nonce != self.server_nonce {
             return Err(HandshakeError::NonceMismatch);
         }
@@ -535,5 +558,56 @@ mod tests {
             client_auth_key, server_auth_key,
             "client and server must derive the same auth_key"
         );
+
+        // Consecutive PFS temp-key handshake (`p_q_inner_data_temp_dc#56fddf88`)
+        // on the very same HandshakeServer / TCP connection.
+        let mut temp_client = TestClient::new();
+        let m1 = temp_client.req_pq();
+        let r1 = match server.handle(&m1).unwrap() {
+            Step::Reply(b) => b,
+            _ => panic!("expected reply on 2nd handshake"),
+        };
+
+        let mut rr = Reader::new(&r1);
+        assert_eq!(rr.read_u32().unwrap(), RES_PQ);
+        let _ = rr.read_i128().unwrap();
+        temp_client.server_nonce = rr.read_i128().unwrap();
+        let pq = be_bytes_to_u64(rr.read_bytes().unwrap());
+        let _ = rr.read_long_vector().unwrap();
+        let (p, q) = mtproto_crypto::factorize::factorize(pq).unwrap();
+
+        let mut inner = Writer::new();
+        inner.write_u32(P_Q_INNER_DATA_TEMP_DC);
+        inner.write_bytes(&pq.to_be_bytes());
+        inner.write_bytes(&p.to_be_bytes());
+        inner.write_bytes(&q.to_be_bytes());
+        inner.write_i128(&temp_client.nonce);
+        inner.write_i128(&temp_client.server_nonce);
+        inner.write_i256(&temp_client.new_nonce);
+        inner.write_i32(2); // dc
+        inner.write_i32(86400); // expires_in
+        let enc = rsa_for_client.seal_pq_inner(&inner.into_vec());
+
+        let mut w = Writer::new();
+        w.write_u32(REQ_DH_PARAMS);
+        w.write_i128(&temp_client.nonce);
+        w.write_i128(&temp_client.server_nonce);
+        w.write_bytes(&p.to_be_bytes());
+        w.write_bytes(&q.to_be_bytes());
+        w.write_i64(rsa_for_client.fingerprint);
+        w.write_bytes(&enc);
+
+        let r2 = match server.handle(&w.into_vec()).unwrap() {
+            Step::Reply(b) => b,
+            _ => panic!("expected server_DH_params_ok for temp_dc"),
+        };
+        let m3 = temp_client.on_server_dh(&r2);
+        match server.handle(&m3).unwrap() {
+            Step::Done { auth_key, .. } => {
+                let server_g_a = server.dh.pow(&server.a);
+                assert_eq!(temp_client.auth_key(&server_g_a), *auth_key);
+            }
+            _ => panic!("expected temp_dc handshake done"),
+        }
     }
 }

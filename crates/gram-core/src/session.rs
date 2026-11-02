@@ -73,7 +73,14 @@ impl Session {
             return Err(SessionError::WrongKey);
         }
         let msg_key: [u8; 16] = payload[8..24].try_into().unwrap();
-        let mut ct = payload[24..].to_vec();
+        // PaddedIntermediate (0xdddddddd) appends 0..15 random bytes outside
+        // the 16-byte-aligned AES-IGE ciphertext; trim them before decrypting.
+        let raw_ct = &payload[24..];
+        let aligned_len = (raw_ct.len() / 16) * 16;
+        if aligned_len < 32 {
+            return Err(SessionError::TooShort);
+        }
+        let mut ct = raw_ct[..aligned_len].to_vec();
         let plaintext =
             kdf::decrypt_message(&self.auth_key, &msg_key, &mut ct, Direction::ClientToServer)?;
 
@@ -131,6 +138,12 @@ impl Session {
         let seq = self.out_seq * 2 + 1;
         self.out_seq += 1;
         seq
+    }
+
+    /// Current service sequence number (even), for MTProto service replies
+    /// (`pong`, `future_salts`, `destroy_session_ok`, `msgs_state_info`).
+    pub fn current_service_seq(&self) -> i32 {
+        self.out_seq * 2
     }
 }
 
@@ -213,5 +226,37 @@ mod tests {
             session.decrypt(&payload),
             Err(SessionError::WrongKey)
         ));
+    }
+
+    #[test]
+    fn padded_intermediate_trailing_bytes_tolerated() {
+        let key = test_key();
+        let session = Session::new(key, 7, 42);
+        let body = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&7i64.to_le_bytes());
+        plaintext.extend_from_slice(&42i64.to_le_bytes());
+        plaintext.extend_from_slice(&999i64.to_le_bytes());
+        plaintext.extend_from_slice(&0i32.to_le_bytes());
+        plaintext.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        plaintext.extend_from_slice(&body);
+        let base = plaintext.len();
+        let mut pad = 16 - (base % 16);
+        if pad < 12 {
+            pad += 16;
+        }
+        plaintext.resize(base + pad, 0);
+        let (msg_key, ct) =
+            kdf::encrypt_message(&key, &plaintext, Direction::ClientToServer).unwrap();
+        for extra in 0..16usize {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&kdf::auth_key_id(&key).to_le_bytes());
+            payload.extend_from_slice(&msg_key);
+            payload.extend_from_slice(&ct);
+            payload.extend(std::iter::repeat_n(0x5au8, extra));
+            let inc = session.decrypt(&payload).unwrap();
+            assert_eq!(inc.msg_id, 999);
+            assert_eq!(inc.body, body);
+        }
     }
 }

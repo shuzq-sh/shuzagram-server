@@ -13,11 +13,12 @@ use mtproto_crypto::rsa_key::ServerRsaKey;
 fn main() {
     let addr = std::env::var("EDGE_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
 
+    let rsa_path = std::env::var("SHUZA_RSA_KEY").ok().filter(|s| !s.is_empty());
     // Persistent key if SHUZA_RSA_KEY points to a file; else an ephemeral key.
-    let rsa = match std::env::var("SHUZA_RSA_KEY").ok().filter(|s| !s.is_empty()) {
+    let rsa = match &rsa_path {
         Some(path) => {
             eprintln!("[edge] loading server RSA-2048 key from {path}");
-            match ServerRsaKey::load_or_generate(&path) {
+            match ServerRsaKey::load_or_generate(path) {
                 Ok(k) => Arc::new(k),
                 Err(e) => {
                     eprintln!("[edge] cannot load/create key at {path}: {e}");
@@ -39,31 +40,55 @@ fn main() {
         return;
     }
 
+    // Persist established auth keys and registered users next to the RSA key
+    // (or SHUZA_AUTHKEYS / SHUZA_USERS), so cached client keys & sessions
+    // survive server restarts.
+    let data_dir = rsa_path.as_ref().map(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_default()
+    });
+    let keys_path = std::env::var("SHUZA_AUTHKEYS").ok().or_else(|| {
+        data_dir
+            .as_ref()
+            .map(|d| d.join("authkeys.bin").to_string_lossy().into_owned())
+    });
+    let users_path = std::env::var("SHUZA_USERS").ok().or_else(|| {
+        data_dir
+            .as_ref()
+            .map(|d| d.join("users.tsv").to_string_lossy().into_owned())
+    });
+
+    let keys = Arc::new(KeyStore::load(keys_path));
+
     // Test-server master code: read from the environment only, never hardcoded.
     // When set, any phone number registers with this code.
     let test_code = std::env::var("SHUZA_TEST_CODE").ok().filter(|s| !s.is_empty());
-    let store = Arc::new(Store::with_test_code(test_code));
+    let store = Arc::new(Store::with_persistence(test_code, users_path));
     if store.is_test_server() {
         eprintln!("[edge] TEST SERVER mode: any number registers with the configured test code");
     }
+
     // Address advertised to clients in help.getConfig. Defaults match the
     // listener; override with SHUZA_DC_IP / SHUZA_DC_PORT / SHUZA_DC_ID.
     let dc = DcEndpoint {
-        dc_id: std::env::var("SHUZA_DC_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+        dc_id: std::env::var("SHUZA_DC_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
         ip: std::env::var("SHUZA_DC_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("SHUZA_DC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8443),
+        port: std::env::var("SHUZA_DC_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8443),
     };
     eprintln!("[edge] advertising dc{} at {}:{}", dc.dc_id, dc.ip, dc.port);
-    let dispatcher = Arc::new(Dispatcher::new(store).with_dc(dc));
-    // Persist established auth keys next to the RSA key (or SHUZA_AUTHKEYS), so
-    // a client's cached key survives server restarts.
-    let keys_path = std::env::var("SHUZA_AUTHKEYS").ok().or_else(|| {
-        std::env::var("SHUZA_RSA_KEY").ok().map(|p| {
-            let dir = std::path::Path::new(&p).parent().map(|d| d.to_path_buf()).unwrap_or_default();
-            dir.join("authkeys.bin").to_string_lossy().into_owned()
-        })
-    });
-    let keys = Arc::new(KeyStore::load(keys_path));
+    let dispatcher = Arc::new(
+        Dispatcher::new(store)
+            .with_keys(Arc::clone(&keys))
+            .with_dc(dc),
+    );
     eprintln!(
         "[edge] rsa fingerprint = {:#018x}  (configure the client with this key)",
         rsa.fingerprint

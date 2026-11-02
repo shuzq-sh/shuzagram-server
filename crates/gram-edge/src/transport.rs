@@ -2,15 +2,11 @@
 //! per-connection serve loop.
 //!
 //! Supports:
-//! - plaintext **Abridged** (first byte `0xef`) and **Intermediate**
-//!   (first 4 bytes `0xeeeeeeee`), used by our own reference client/tests;
-//! - **Obfuscated2** (random 64-byte header, AES-256-CTR) with an Abridged or
-//!   Intermediate inner protocol — what the stock Telegram/ShuzaGram client
-//!   uses for a direct connection.
-//!
-//! Inside each frame is a *bare* MTProto message during the handshake
-//! (`auth_key_id(0) | message_id | length | body`) and an encrypted message
-//! afterwards.
+//! - plaintext **Abridged** (`0xef`), **Intermediate** (`0xeeeeeeee`), and
+//!   **Padded Intermediate** (`0xdddddddd`);
+//! - **Obfuscated2** (random 64-byte header, AES-256-CTR) with an Abridged
+//!   (`0xefefefef`), Intermediate (`0xeeeeeeee`), or Padded Intermediate
+//!   (`0xdddddddd`) inner protocol — what the ShuzaGram Android client uses.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -18,19 +14,26 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use gram_core::dispatch::ConnContext;
+use gram_core::dispatch::{ConnContext, OutboundKind};
 use gram_core::{Dispatcher, Session};
 use mtproto_crypto::dh::DhParams;
 use mtproto_crypto::rsa_key::ServerRsaKey;
 
 use crate::handshake::{HandshakeServer, Step};
+use crate::keystore::KeyStore;
 
 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
+
+/// MTProto transport-level error frame `-404` (`auth_key_id` not found), which
+/// instructs `tgnet` (`ConnectionsManager.cpp`) to drop the stale cached key
+/// and start a fresh DH handshake instead of reconnecting in an infinite loop.
+const TRANSPORT_ERR_UNKNOWN_KEY: i32 = -404;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Inner {
     Abridged,
     Intermediate,
+    PaddedIntermediate,
 }
 
 /// A connection with its transport framing and (for obfuscated transports) the
@@ -67,6 +70,14 @@ impl Conn {
                 enc: None,
             });
         }
+        if b0[0] == 0xdd && rest == [0xdd, 0xdd, 0xdd] {
+            return Ok(Conn {
+                sock,
+                inner: Inner::PaddedIntermediate,
+                dec: None,
+                enc: None,
+            });
+        }
 
         // Obfuscated2: the first 4 bytes are the start of a 64-byte nonce.
         let mut nonce = [0u8; 64];
@@ -96,6 +107,7 @@ impl Conn {
         let inner = match tag {
             0xefef_efef => Inner::Abridged,
             0xeeee_eeee => Inner::Intermediate,
+            0xdddd_dddd => Inner::PaddedIntermediate,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -134,10 +146,16 @@ impl Conn {
     /// MTProto message).
     fn read_frame(&mut self) -> io::Result<Vec<u8>> {
         match self.inner {
-            Inner::Intermediate => {
+            Inner::Intermediate | Inner::PaddedIntermediate => {
                 let mut len_buf = [0u8; 4];
                 self.read_exact(&mut len_buf)?;
                 let len = (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize;
+                if len > 4 * 1024 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("oversized frame {len}"),
+                    ));
+                }
                 let mut payload = vec![0u8; len];
                 self.read_exact(&mut payload)?;
                 Ok(payload)
@@ -153,6 +171,12 @@ impl Conn {
                     self.read_exact(&mut l)?;
                     l[0] as usize | (l[1] as usize) << 8 | (l[2] as usize) << 16
                 };
+                if words > 1024 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("oversized abridged frame {words} words"),
+                    ));
+                }
                 let mut payload = vec![0u8; words * 4];
                 self.read_exact(&mut payload)?;
                 Ok(payload)
@@ -160,10 +184,11 @@ impl Conn {
         }
     }
 
-    /// Write one transport frame around `payload`.
+    /// Write one transport frame around `payload` (`payload.len()` is always a
+    /// multiple of 4, including the 4-byte `-404` transport error code).
     fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
         match self.inner {
-            Inner::Intermediate => {
+            Inner::Intermediate | Inner::PaddedIntermediate => {
                 let mut out = Vec::with_capacity(4 + payload.len());
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
@@ -188,12 +213,8 @@ impl Conn {
     }
 }
 
-use crate::keystore::KeyStore;
-
 /// Run a connection: detect the transport, then serve a unified loop that
-/// handles unencrypted handshake messages and encrypted session messages. The
-/// client may handshake then send encrypted traffic on the same connection, or
-/// open a new connection and send encrypted traffic with an already-known key.
+/// handles unencrypted handshake messages and encrypted session messages.
 pub fn serve_connection(
     sock: TcpStream,
     rsa: &ServerRsaKey,
@@ -201,6 +222,10 @@ pub fn serve_connection(
     dispatcher: &Arc<Dispatcher>,
     keys: &Arc<KeyStore>,
 ) -> io::Result<()> {
+    let peer = sock
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
     let mut conn = Conn::accept(sock)?;
     let mut hs = HandshakeServer::new(rsa.clone(), dh.clone());
     let mut session: Option<Session> = None;
@@ -237,9 +262,11 @@ pub fn serve_connection(
                     server_salt,
                 }) => {
                     conn.write_frame(&build_bare(&reply))?;
-                    eprintln!("[edge]   established auth_key id={auth_key_id:#018x}");
+                    eprintln!("[edge] {peer}: established auth_key id={auth_key_id:#018x}");
                     keys.insert(auth_key_id, *auth_key, server_salt);
                     session = Some(Session::new(*auth_key, server_salt, 0));
+                    ctx.auth_key_id = auth_key_id;
+                    ctx.server_salt = server_salt;
                 }
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
             }
@@ -248,15 +275,21 @@ pub fn serve_connection(
 
         // Encrypted message: ensure we have a session for this key.
         if session.as_ref().map(|s| s.auth_key_id()) != Some(auth_key_id) {
-            let found = keys.get(auth_key_id);
-            match found {
-                Some((key, salt)) => session = Some(Session::new(key, salt, 0)),
+            match keys.get(auth_key_id) {
+                Some((key, salt)) => {
+                    session = Some(Session::new(key, salt, 0));
+                    ctx.auth_key_id = auth_key_id;
+                    ctx.server_salt = salt;
+                    ctx.user = None; // re-hydrated in dispatcher via perm_key binding
+                }
                 None => {
-                    // Unknown key (handshake not seen yet): drop this connection.
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("encrypted message for unknown auth_key_id {auth_key_id:#018x}"),
-                    ));
+                    // Send MTProto -404 transport error frame so the client
+                    // drops the stale key and triggers a fresh DH handshake!
+                    eprintln!(
+                        "[edge] {peer}: unknown auth_key_id {auth_key_id:#018x} -> sending -404"
+                    );
+                    conn.write_frame(&TRANSPORT_ERR_UNKNOWN_KEY.to_le_bytes())?;
+                    continue;
                 }
             }
         }
@@ -265,12 +298,19 @@ pub fn serve_connection(
             Ok(m) => m,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         };
-        if s.session_id == 0 {
+        if s.session_id != incoming.session_id {
             s.session_id = incoming.session_id;
         }
-        for reply in dispatcher.handle_message(&mut ctx, incoming.msg_id, &incoming.body) {
-            let seq = s.next_content_seq();
-            let enc = s.encrypt(next_message_id(), seq, &reply);
+        ctx.auth_key_id = auth_key_id;
+        ctx.server_salt = s.server_salt;
+        ctx.session_id = incoming.session_id;
+
+        for out in dispatcher.handle_message_ex(&mut ctx, incoming.msg_id, &incoming.body) {
+            let seq = match out.kind {
+                OutboundKind::Content => s.next_content_seq(),
+                OutboundKind::Service => s.current_service_seq(),
+            };
+            let enc = s.encrypt(next_message_id(), seq, &out.body);
             conn.write_frame(&enc)?;
         }
     }

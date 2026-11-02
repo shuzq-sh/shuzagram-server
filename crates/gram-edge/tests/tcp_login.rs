@@ -119,3 +119,40 @@ fn full_login_over_tcp() {
     assert_eq!(phone, "+99900099999");
     assert_eq!(first_name, "ShuzaGram");
 }
+
+#[test]
+fn unknown_auth_key_returns_minus_404_on_padded_intermediate() {
+    use std::io::{Read, Write};
+
+    let rsa = ServerRsaKey::generate();
+    let rsa_server = rsa.clone();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let dh = dh::server_default();
+        let store = Arc::new(Store::new());
+        let keys = Arc::new(gram_edge::keystore::KeyStore::load(None));
+        let dispatcher = Arc::new(Dispatcher::new(store).with_keys(Arc::clone(&keys)));
+        let _ = transport::serve_connection(sock, &rsa_server, &dh, &dispatcher, &keys);
+    });
+
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    // PaddedIntermediate (0xdddddddd) transport header.
+    sock.write_all(&0xdddd_ddddu32.to_le_bytes()).unwrap();
+    // Send a 75-byte bogus encrypted packet (with 3 random padding bytes) for unknown key_id.
+    let mut bogus = vec![0x11u8; 75];
+    bogus[0..8].copy_from_slice(&0x2e9b_192a_1658_1256i64.to_le_bytes());
+    sock.write_all(&(bogus.len() as u32).to_le_bytes()).unwrap();
+    sock.write_all(&bogus).unwrap();
+    sock.flush().unwrap();
+
+    // Server must reply with a 4-byte frame containing -404 (0xfffffe6c) instead of EOF!
+    let mut len_buf = [0u8; 4];
+    sock.read_exact(&mut len_buf).unwrap();
+    assert_eq!(u32::from_le_bytes(len_buf), 4);
+    let mut code_buf = [0u8; 4];
+    sock.read_exact(&mut code_buf).unwrap();
+    assert_eq!(i32::from_le_bytes(code_buf), -404);
+}
