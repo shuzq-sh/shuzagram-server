@@ -76,7 +76,11 @@ const DC_OPTION: u32 = 0x18b7_a10d;
 const HELP_GET_NEAREST_DC: u32 = 0x1fb3_3026;
 const NEAREST_DC: u32 = 0x8e1a_1775;
 const HELP_GET_COUNTRIES_LIST: u32 = 0x7357_87a8;
+const HELP_COUNTRIES_LIST: u32 = 0x87d0_759e;
 const HELP_COUNTRIES_LIST_NOT_MODIFIED: u32 = 0x93cc_1f32;
+const HELP_COUNTRY: u32 = 0xc387_8e23;
+const HELP_COUNTRY_CODE: u32 = 0x4203_c5ef;
+const COUNTRIES_HASH: i32 = 0x2026_1102;
 const HELP_GET_APP_CONFIG: u32 = 0x61e3_f854;
 const HELP_GET_APP_CONFIG_LEGACY: u32 = 0x9891_4110;
 const HELP_APP_CONFIG: u32 = 0xdd18_782e;
@@ -358,7 +362,7 @@ impl Dispatcher {
 
             HELP_GET_CONFIG => config(&self.dc),
             HELP_GET_NEAREST_DC => nearest_dc(&self.dc),
-            HELP_GET_COUNTRIES_LIST => empty_ctor(HELP_COUNTRIES_LIST_NOT_MODIFIED),
+            HELP_GET_COUNTRIES_LIST => countries_list(r),
             HELP_GET_APP_CONFIG | HELP_GET_APP_CONFIG_LEGACY => app_config(),
             HELP_GET_TERMS_OF_SERVICE_UPDATE => terms_of_service_empty(),
             HELP_GET_PROMO_DATA => promo_data_empty(),
@@ -673,9 +677,65 @@ fn empty_vector() -> Vec<u8> {
 fn nearest_dc(dc: &DcEndpoint) -> Vec<u8> {
     let mut w = Writer::new();
     w.write_u32(NEAREST_DC);
-    w.write_string("US");
+    w.write_string("RU");
     w.write_i32(dc.dc_id);
     w.write_i32(dc.dc_id);
+    w.into_vec()
+}
+
+/// `help.getCountriesList#735787a8 lang_code:string hash:int = help.CountriesList`
+///
+/// Important: Android `LoginActivity.loadCountries()` sends `hash = 0` and
+/// casts the response directly to `TL_help_countriesList` without checking for
+/// `TL_help_countriesListNotModified`! Always return the full `TL_help_countriesList`
+/// unless `hash` matches `COUNTRIES_HASH`.
+fn countries_list(r: &mut Reader) -> Vec<u8> {
+    let _lang_code = r.read_string();
+    let hash = r.read_i32().unwrap_or(0);
+    if hash != 0 && hash == COUNTRIES_HASH {
+        return empty_ctor(HELP_COUNTRIES_LIST_NOT_MODIFIED);
+    }
+
+    const RAW_COUNTRIES: &str = include_str!("countries.txt");
+    let rows: Vec<(&str, &str, &str, Option<&str>)> = RAW_COUNTRIES
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let mut parts = line.splitn(4, ';');
+            let code = parts.next()?;
+            let iso2 = parts.next()?;
+            let name = parts.next()?;
+            let pattern = parts.next().filter(|p| !p.is_empty());
+            Some((code, iso2, name, pattern))
+        })
+        .collect();
+
+    let mut w = Writer::new();
+    w.write_u32(HELP_COUNTRIES_LIST);
+    w.write_vector_header(rows.len());
+    for (code, iso2, default_name, pattern) in rows {
+        // TL_help_country#c3878e23 flags:# hidden:flags.0?true iso2:string default_name:string name:flags.1?string country_codes:Vector<help.CountryCode>
+        w.write_u32(HELP_COUNTRY);
+        w.write_i32(0); // flags (not hidden, localized name omitted -> client uses default_name)
+        w.write_string(iso2);
+        w.write_string(default_name);
+        w.write_vector_header(1);
+        // TL_help_countryCode#4203c5ef flags:# country_code:string prefixes:flags.0?Vector<string> patterns:flags.1?Vector<string>
+        w.write_u32(HELP_COUNTRY_CODE);
+        if let Some(pat) = pattern {
+            w.write_i32(1 << 1); // FLAG_1: patterns present
+            w.write_string(code);
+            w.write_vector_header(1);
+            w.write_string(pat);
+        } else {
+            w.write_i32(0);
+            w.write_string(code);
+        }
+    }
+    w.write_i32(COUNTRIES_HASH);
     w.into_vec()
 }
 
@@ -1242,6 +1302,55 @@ mod tests {
         let out = d.handle_message(&mut ctx, 42, &w.into_vec());
         let (_req, res) = unwrap_rpc_result(&out[0]);
         assert_eq!(Reader::new(&res).read_u32().unwrap(), NEAREST_DC);
+    }
+
+    #[test]
+    fn help_get_countries_list_returns_full_list_when_hash_zero() {
+        let store = Arc::new(Store::new());
+        let d = Dispatcher::new(store);
+
+        let mut q = Writer::new();
+        q.write_u32(HELP_GET_COUNTRIES_LIST);
+        q.write_string("ru");
+        q.write_i32(0); // hash = 0, as Android LoginActivity sends
+
+        let mut ctx = ConnContext::default();
+        let out = d.handle_message(&mut ctx, 43, &invoke_with_layer(&q.into_vec()));
+        let (_req, res) = unwrap_rpc_result(&out[0]);
+
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), HELP_COUNTRIES_LIST);
+        let n = r.read_vector_header().unwrap();
+        assert!(n >= 200, "expected full country list, got {n}");
+        for _ in 0..n {
+            assert_eq!(r.read_u32().unwrap(), HELP_COUNTRY);
+            let cflags = r.read_i32().unwrap();
+            let _iso2 = r.read_string().unwrap();
+            let _def_name = r.read_string().unwrap();
+            if cflags & (1 << 1) != 0 {
+                let _name = r.read_string().unwrap();
+            }
+            let kc = r.read_vector_header().unwrap();
+            for _ in 0..kc {
+                assert_eq!(r.read_u32().unwrap(), HELP_COUNTRY_CODE);
+                let kflags = r.read_i32().unwrap();
+                let _code = r.read_string().unwrap();
+                if kflags & (1 << 0) != 0 {
+                    let pn = r.read_vector_header().unwrap();
+                    for _ in 0..pn {
+                        let _ = r.read_string().unwrap();
+                    }
+                }
+                if kflags & (1 << 1) != 0 {
+                    let pn = r.read_vector_header().unwrap();
+                    for _ in 0..pn {
+                        let _ = r.read_string().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(r.read_i32().unwrap(), COUNTRIES_HASH);
+        assert!(r.is_empty(), "countriesList must be consumed completely");
     }
 
     #[test]
