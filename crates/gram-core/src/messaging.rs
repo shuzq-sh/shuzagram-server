@@ -2587,11 +2587,60 @@ impl Dispatcher {
         w.into_vec()
     }
 
-    pub fn payments_get_star_gift_collections(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+    pub fn payments_get_star_gift_collections(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _peer = parse_input_peer(r, ctx.user.as_ref().map(|u| u.id));
+        let hash = r.read_i64().unwrap_or(0);
         let mut w = Writer::new();
-        w.write_u32(TL_PAYMENTS_STAR_GIFT_COLLECTIONS);
-        w.write_i32(0); // count
-        w.write_vector_header(0); // collections
+        if hash != 0 {
+            w.write_u32(0xa0ba_4f17); // payments.starGiftCollectionsNotModified#a0ba4f17
+        } else {
+            w.write_u32(TL_PAYMENTS_STAR_GIFT_COLLECTIONS);
+            w.write_vector_header(0); // collections: Vector<StarGiftCollection> (empty)
+        }
+        w.into_vec()
+    }
+
+    pub fn payments_get_star_gift_active_auctions(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let hash = r.read_i64().unwrap_or(0);
+        let mut w = Writer::new();
+        if hash != 0 {
+            w.write_u32(0xdb33_dad0); // payments.starGiftActiveAuctionsNotModified#db33dad0
+        } else {
+            w.write_u32(0xaef6_abbc); // payments.starGiftActiveAuctions#aef6abbc
+            w.write_vector_header(0); // auctions
+            w.write_vector_header(0); // users
+            w.write_vector_header(0); // chats
+        }
+        w.into_vec()
+    }
+
+    pub fn payments_get_stars_topup_options(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x1cb5_c415); // VECTOR
+        let tiers: &[(i64, i64, &str)] = &[
+            (50, 99, "com.telegram.stars.50"),
+            (100, 199, "com.telegram.stars.100"),
+            (250, 499, "com.telegram.stars.250"),
+            (500, 999, "com.telegram.stars.500"),
+            (1000, 1999, "com.telegram.stars.1000"),
+            (2500, 4999, "com.telegram.stars.2500"),
+        ];
+        w.write_i32(tiers.len() as i32);
+        for &(stars, amount_cents, product) in tiers {
+            w.write_u32(0x0bd9_15c0); // starsTopupOption#0bd915c0
+            w.write_i32(1); // flags: store_product
+            w.write_i64(stars);
+            w.write_string(product);
+            w.write_string("USD");
+            w.write_i64(amount_cents);
+        }
+        w.into_vec()
+    }
+
+    pub fn payments_get_stars_revenue_ads_account_url(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x394e_7f21); // payments.starsRevenueAdsAccountUrl#394e7f21
+        w.write_string("https://fragment.com/ads");
         w.into_vec()
     }
 

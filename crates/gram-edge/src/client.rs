@@ -182,9 +182,26 @@ impl Client {
         let msg_id = self.next_msg_id();
         let enc = self.encrypt(msg_id, query);
         self.send_frame(&enc)?;
-        let payload = self.recv_frame()?;
-        let body = self.decrypt_session(&payload);
-        Ok((msg_id, body))
+        loop {
+            let payload = self.recv_frame()?;
+            let body = self.decrypt_session(&payload);
+            let mut r = Reader::new(&body);
+            let ctor = r.read_u32().unwrap_or(0);
+            if ctor == 0x9ec2_0908 {
+                // new_session_created#9ec20908 first_msg_id:long unique_id:long server_salt:long
+                let _first_msg_id = r.read_i64();
+                let _unique_id = r.read_i64();
+                if let Ok(salt) = r.read_i64() {
+                    self.salt = salt;
+                }
+                continue;
+            }
+            if ctor == 0x62d6_b459 {
+                // msgs_ack
+                continue;
+            }
+            return Ok((msg_id, body));
+        }
     }
 
     fn encrypt(&self, msg_id: i64, body: &[u8]) -> Vec<u8> {

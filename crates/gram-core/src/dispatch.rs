@@ -669,6 +669,10 @@ impl Dispatcher {
             0xdea2_0a39 => self.messages_get_available_effects(ctx, r), // messages.getAvailableEffects
             0xd89a_83a3 => self.users_get_requirements_to_contact(ctx, r), // users.getRequirementsToContact
             0x981b_91dd => self.payments_get_star_gift_collections(ctx, r), // payments.getStarGiftCollections
+            0xa5d0_514d => self.payments_get_star_gift_active_auctions(ctx, r), // payments.getStarGiftActiveAuctions
+            0xc00e_c7d3 => self.payments_get_stars_topup_options(ctx, r), // payments.getStarsTopupOptions
+            0xbd1e_fd3e => empty_vector(), // payments.getStarsGiveawayOptions
+            0xd1d7_efc5 | 0x394e_7f83 => self.payments_get_stars_revenue_ads_account_url(ctx, r), // payments.getStarsRevenueAdsAccountUrl
             0x25b3_eac7 => self.stories_get_albums(ctx, r), // stories.getAlbums
             0x7849_9170 => self.stories_get_peer_max_ids(ctx, r), // stories.getPeerMaxIDs
             0x9b5a_e7f9 => self.stories_get_all_read_peer_stories(ctx, r), // stories.getAllReadPeerStories
@@ -1282,51 +1286,87 @@ fn app_config() -> Vec<u8> {
     w.write_u32(HELP_APP_CONFIG);
     w.write_i32(now_unix()); // hash
     w.write_u32(JSON_OBJECT);
-    w.write_vector_header(8);
+    w.write_vector_header(14);
 
-    // 1. stars_gifts_enabled - REQUIRED by Telegram clients to show the Star Gifts catalog!
+    // 1. stargifts_blocked - MUST BE FALSE! (Android client defaults to true which hides the star gift grid)
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stargifts_blocked");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(false);
+
+    // 2. stars_purchase_blocked - MUST BE FALSE! (Android client defaults starsLocked to true)
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_purchase_blocked");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(false);
+
+    // 3. premium_purchase_blocked - MUST BE FALSE!
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("premium_purchase_blocked");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(false);
+
+    // 4. stars_gifts_enabled - REQUIRED by Telegram clients to show the Star Gifts catalog!
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("stars_gifts_enabled");
     w.write_u32(JSON_BOOL);
     w.write_bool(true);
 
-    // 2. stars_paid_reactions_enabled
+    // 5. stargifts_pinned_to_top_limit
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stargifts_pinned_to_top_limit");
+    w.write_u32(JSON_NUMBER);
+    w.write_f64(6.0);
+
+    // 6. stars_stargift_resale_amount_min
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_stargift_resale_amount_min");
+    w.write_u32(JSON_NUMBER);
+    w.write_f64(100.0);
+
+    // 7. giveaway_gifts_purchase_available
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("giveaway_gifts_purchase_available");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 8. stars_paid_reactions_enabled
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("stars_paid_reactions_enabled");
     w.write_u32(JSON_BOOL);
     w.write_bool(true);
 
-    // 3. stars_subscriptions_enabled
+    // 9. stars_subscriptions_enabled
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("stars_subscriptions_enabled");
     w.write_u32(JSON_BOOL);
     w.write_bool(true);
 
-    // 4. stars_revenue_withdrawal_enabled
+    // 10. stars_revenue_withdrawal_enabled
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("stars_revenue_withdrawal_enabled");
     w.write_u32(JSON_BOOL);
     w.write_bool(true);
 
-    // 5. giveaway_gifts_enabled
+    // 11. giveaway_gifts_enabled
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("giveaway_gifts_enabled");
     w.write_u32(JSON_BOOL);
     w.write_bool(true);
 
-    // 6. stars_usd_rate
+    // 12. stars_usd_rate
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("stars_usd_rate");
     w.write_u32(JSON_NUMBER);
     w.write_f64(0.013);
 
-    // 7. saved_star_gifts_limit_default
+    // 13. saved_star_gifts_limit_default
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("saved_star_gifts_limit_default");
     w.write_u32(JSON_NUMBER);
     w.write_f64(100.0);
 
-    // 8. saved_star_gifts_limit_premium
+    // 14. saved_star_gifts_limit_premium
     w.write_u32(JSON_OBJECT_VALUE);
     w.write_string("saved_star_gifts_limit_premium");
     w.write_u32(JSON_NUMBER);
@@ -2897,5 +2937,73 @@ mod tests {
         assert_eq!(r.read_i32().unwrap(), 0);
         let count = r.read_i32().unwrap();
         assert_eq!(count, 1);
+
+        // 6. help.getAppConfig must contain stargifts_blocked=false, stars_purchase_blocked=false, premium_purchase_blocked=false
+        let mut q = Writer::new();
+        q.write_u32(HELP_GET_APP_CONFIG);
+        q.write_i32(0); // hash
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 206, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), HELP_APP_CONFIG);
+        let _config_hash = r.read_i32().unwrap();
+        assert_eq!(r.read_u32().unwrap(), JSON_OBJECT);
+        let vlen = r.read_vector_header().unwrap();
+        let mut kv = std::collections::HashMap::new();
+        for _ in 0..vlen {
+            assert_eq!(r.read_u32().unwrap(), JSON_OBJECT_VALUE);
+            let k = r.read_string().unwrap().to_string();
+            let val_ctor = r.read_u32().unwrap();
+            match val_ctor {
+                JSON_BOOL => {
+                    let b = r.read_bool().unwrap();
+                    kv.insert(k, format!("bool:{b}"));
+                }
+                JSON_NUMBER => {
+                    let n = r.read_f64().unwrap();
+                    kv.insert(k, format!("num:{n}"));
+                }
+                JSON_STRING => {
+                    let s = r.read_string().unwrap();
+                    kv.insert(k, format!("str:{s}"));
+                }
+                other => panic!("unexpected json value ctor {other:#x}"),
+            }
+        }
+        assert_eq!(r.remaining(), 0, "app_config response has leftover bytes");
+        assert_eq!(kv.get("stargifts_blocked").map(|s| s.as_str()), Some("bool:false"));
+        assert_eq!(kv.get("stars_purchase_blocked").map(|s| s.as_str()), Some("bool:false"));
+        assert_eq!(kv.get("premium_purchase_blocked").map(|s| s.as_str()), Some("bool:false"));
+        assert_eq!(kv.get("stars_gifts_enabled").map(|s| s.as_str()), Some("bool:true"));
+
+        // 7. payments.getStarGiftCollections hash=0 returns 0x8a29_32f3 with Vector(0) and 0 remaining
+        let mut q = Writer::new();
+        q.write_u32(0x981b_91dd); // payments.getStarGiftCollections
+        q.write_u32(INPUT_PEER_SELF);
+        q.write_i64(0); // hash = 0
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 207, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0x8a29_32f3); // payments.starGiftCollections
+        let collections_count = r.read_vector_header().unwrap();
+        assert_eq!(collections_count, 0);
+        assert_eq!(r.remaining(), 0, "payments.starGiftCollections must have 0 leftover bytes (no spurious count int!)");
+
+        // 8. payments.getStarGiftCollections hash!=0 returns 0xa0ba_4f17 (not modified)
+        let mut q = Writer::new();
+        q.write_u32(0x981b_91dd); // payments.getStarGiftCollections
+        q.write_u32(INPUT_PEER_SELF);
+        q.write_i64(12345); // hash != 0
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 208, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        assert_eq!(r.read_u32().unwrap(), 0xa0ba_4f17); // payments.starGiftCollectionsNotModified
+        assert_eq!(r.remaining(), 0);
+
+        // 9. payments.getStarsTopupOptions returns Vector<starsTopupOption>
+        let mut q = Writer::new();
+        q.write_u32(0xc00e_c7d3); // payments.getStarsTopupOptions
+        let (_, res) = unwrap_rpc_result(&d.handle_message(&mut ctx, 209, &q.into_vec())[0]);
+        let mut r = Reader::new(&res);
+        let topup_count = r.read_vector_header().unwrap();
+        assert!(topup_count > 0);
+        assert_eq!(r.read_u32().unwrap(), 0x0bd9_15c0); // starsTopupOption
     }
 }
