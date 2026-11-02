@@ -2,6 +2,7 @@
 //! unencrypted DH handshake that establishes a session `auth_key`.
 
 pub mod admin;
+pub mod alerts;
 pub mod async_edge;
 pub mod botapi;
 pub mod client;

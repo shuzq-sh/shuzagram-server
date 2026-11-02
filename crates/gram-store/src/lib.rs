@@ -593,6 +593,12 @@ impl AcidStore {
                 bytes           BLOB NOT NULL,
                 PRIMARY KEY (file_id, file_part)
             );
+
+            CREATE TABLE IF NOT EXISTS server_settings (
+                setting_key   TEXT PRIMARY KEY,
+                setting_val   TEXT NOT NULL,
+                updated_at    INTEGER NOT NULL
+            );
             ",
         )?;
 
@@ -3169,6 +3175,27 @@ impl AcidStore {
         .unwrap()
         .filter_map(Result::ok)
         .collect()
+    }
+
+    pub fn get_setting(&self, key: &str) -> Option<String> {
+        let db = self.conn.lock().unwrap();
+        db.query_row(
+            "SELECT setting_val FROM server_settings WHERE setting_key = ?1",
+            params![key],
+            |r| r.get(0),
+        ).ok()
+    }
+
+    pub fn set_setting(&self, key: &str, val: &str) -> Result<(), StoreError> {
+        let db = self.conn.lock().unwrap();
+        let now = now_unix_i32();
+        db.execute(
+            "INSERT INTO server_settings (setting_key, setting_val, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(setting_key) DO UPDATE SET setting_val = excluded.setting_val, updated_at = excluded.updated_at",
+            params![key, val, now],
+        )?;
+        Ok(())
     }
 }
 

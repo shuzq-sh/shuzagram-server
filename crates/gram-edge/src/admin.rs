@@ -399,6 +399,48 @@ pub(crate) async fn handle_admin_route(
             });
             (200, "application/json", serde_json::to_vec(&res).unwrap_or_default())
         }
+        "/api/alerts/config" if method == "GET" => {
+            let cfg = crate::alerts::AlertConfig::load(store);
+            (200, "application/json", serde_json::to_vec(&cfg).unwrap_or_default())
+        }
+        "/api/alerts/config" if method == "POST" => {
+            if let Ok(cfg) = serde_json::from_slice::<crate::alerts::AlertConfig>(body) {
+                cfg.save(store);
+                (200, "application/json", b"{\"ok\":true}".to_vec())
+            } else {
+                (400, "application/json", b"{\"ok\":false,\"description\":\"Invalid JSON payload\"}".to_vec())
+            }
+        }
+        "/api/alerts/test-telegram" if method == "POST" => {
+            let val: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let token = val.get("token").and_then(|v| v.as_str()).unwrap_or("");
+            let chat_id = val.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            match crate::alerts::test_telegram_alert(token, chat_id).await {
+                Ok(msg) => {
+                    let res = json!({ "ok": true, "message": msg });
+                    (200, "application/json", serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(err) => {
+                    let res = json!({ "ok": false, "error": err });
+                    (400, "application/json", serde_json::to_vec(&res).unwrap_or_default())
+                }
+            }
+        }
+        "/api/alerts/test-email" if method == "POST" => {
+            let val: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let url = val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let to = val.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            match crate::alerts::test_email_alert(url, to).await {
+                Ok(msg) => {
+                    let res = json!({ "ok": true, "message": msg });
+                    (200, "application/json", serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(err) => {
+                    let res = json!({ "ok": false, "error": err });
+                    (400, "application/json", serde_json::to_vec(&res).unwrap_or_default())
+                }
+            }
+        }
         _ => (404, "application/json", b"{\"ok\":false,\"error\":\"Not Found\"}".to_vec()),
     }
 }
@@ -451,6 +493,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button onclick="setTab('users')" id="tab-users" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">Users & Stars</button>
       <button onclick="setTab('gifts')" id="tab-gifts" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">Star Gifts Catalog</button>
       <button onclick="setTab('notif')" id="tab-notif" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">📢 System Notifications</button>
+      <button onclick="setTab('alerts')" id="tab-alerts" class="pb-3 text-slate-400 hover:text-slate-200 cursor-pointer">🔔 Webhooks & Alerts</button>
     </div>
 
     <!-- Tab 1: Live RPC Sniffer -->
@@ -579,6 +622,87 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- Tab 6: Webhooks & Alerts -->
+    <div id="view-alerts" class="hidden space-y-6">
+      <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl max-w-3xl space-y-6">
+        <div>
+          <h2 class="text-lg font-bold flex items-center gap-2">
+            <span class="text-amber-400">🔔</span>
+            <span>Настройка вебхуков и внешних уведомлений</span>
+          </h2>
+          <p class="text-xs text-slate-400 mt-1">
+            Перенаправление системных алертов, регистраций и событий авторизации в бота Telegram, на Email и через Custom Webhooks.
+          </p>
+        </div>
+
+        <!-- Telegram Directed Bot -->
+        <div class="bg-slate-900/80 p-5 rounded-lg border border-slate-700/80 space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-bold text-sky-400 flex items-center gap-2">
+              <span>✈️ Направленный вебхук в Telegram Бота</span>
+            </h3>
+            <button onclick="testTelegramAlert()" class="px-3 py-1 bg-sky-600 hover:bg-sky-500 text-xs font-semibold rounded cursor-pointer">Проверить отправку</button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Telegram Bot Token</label>
+              <input id="alert-tg-token" type="password" placeholder="123456789:ABCDef..." class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-slate-200 font-mono">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Target Chat ID (группа/канал/личка)</label>
+              <input id="alert-tg-chat" type="text" placeholder="-100123456789" class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-slate-200 font-mono">
+            </div>
+          </div>
+          <div id="tg-test-res" class="text-xs font-mono"></div>
+        </div>
+
+        <!-- Email Webhook / Relay -->
+        <div class="bg-slate-900/80 p-5 rounded-lg border border-slate-700/80 space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-bold text-emerald-400 flex items-center gap-2">
+              <span>✉️ Уведомления по почте (Email Webhook / Relay)</span>
+            </h3>
+            <button onclick="testEmailAlert()" class="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold rounded cursor-pointer">Проверить отправку</button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Email получателя</label>
+              <input id="alert-email-to" type="email" placeholder="admin@example.com" class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-slate-200">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Email Webhook URL (SendGrid / Mailgun / Postmark / Bridge)</label>
+              <input id="alert-email-url" type="url" placeholder="https://api.your-email-bridge.com/send" class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-slate-200 font-mono">
+            </div>
+          </div>
+          <div id="email-test-res" class="text-xs font-mono"></div>
+        </div>
+
+        <!-- Custom Generic Webhook -->
+        <div class="bg-slate-900/80 p-5 rounded-lg border border-slate-700/80 space-y-3">
+          <h3 class="text-sm font-bold text-purple-400">🌐 Универсальный Custom Webhook URL</h3>
+          <input id="alert-custom-url" type="url" placeholder="https://hooks.yourdomain.com/shuzagram-events" class="w-full bg-slate-800 border border-slate-700 rounded p-2 text-xs text-slate-200 font-mono">
+        </div>
+
+        <!-- Event Selection -->
+        <div class="space-y-2 text-xs">
+          <span class="block text-slate-400 font-semibold uppercase">События для триггера:</span>
+          <div class="grid grid-cols-2 gap-2 text-slate-300">
+            <label class="flex items-center gap-2"><input id="ev-login" type="checkbox" checked class="rounded"> Вход и регистрация пользователей</label>
+            <label class="flex items-center gap-2"><input id="ev-code" type="checkbox" checked class="rounded"> Отправка SMS-кодов авторизации</label>
+            <label class="flex items-center gap-2"><input id="ev-stars" type="checkbox" checked class="rounded"> Покупка Stars и NFT-подарков</label>
+            <label class="flex items-center gap-2"><input id="ev-support" type="checkbox" checked class="rounded"> Системные алерты и поддержка</label>
+          </div>
+        </div>
+
+        <div class="pt-2 flex items-center justify-between border-t border-slate-700">
+          <button onclick="saveAlertConfig()" class="px-5 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded font-semibold text-sm transition cursor-pointer">
+            💾 Сохранить настройки вебхуков
+          </button>
+          <span id="alert-save-status" class="text-xs text-slate-400 font-mono"></span>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -586,7 +710,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     let snifferRows = [];
 
     function setTab(name) {
-      ['sniffer', 'sessions', 'users', 'gifts', 'notif'].forEach(t => {
+      ['sniffer', 'sessions', 'users', 'gifts', 'notif', 'alerts'].forEach(t => {
         document.getElementById('view-' + t).classList.toggle('hidden', t !== name);
         document.getElementById('tab-' + t).classList.toggle('tab-active', t === name);
         document.getElementById('tab-' + t).classList.toggle('text-slate-400', t !== name);
@@ -594,6 +718,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       if (name === 'sessions') loadSessions();
       if (name === 'users') loadUsers();
       if (name === 'gifts') loadGifts();
+      if (name === 'alerts') loadAlertConfig();
     }
 
     function togglePause() {
@@ -748,6 +873,97 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         statusEl.textContent = 'Ошибка сети: ' + e;
       }
     }
+
+    async function loadAlertConfig() {
+      try {
+        const r = await fetch('/api/alerts/config');
+        const cfg = await r.json();
+        document.getElementById('alert-tg-token').value = cfg.telegram_bot_token || '';
+        document.getElementById('alert-tg-chat').value = cfg.telegram_chat_id || '';
+        document.getElementById('alert-email-to').value = cfg.email_recipient || '';
+        document.getElementById('alert-email-url').value = cfg.email_webhook_url || '';
+        document.getElementById('alert-custom-url').value = cfg.custom_webhook_url || '';
+        document.getElementById('ev-login').checked = cfg.notify_on_login !== false;
+        document.getElementById('ev-code').checked = cfg.notify_on_code !== false;
+        document.getElementById('ev-stars').checked = cfg.notify_on_stars !== false;
+        document.getElementById('ev-support').checked = cfg.notify_on_support !== false;
+      } catch (e) {}
+    }
+
+    async function saveAlertConfig() {
+      const cfg = {
+        telegram_bot_token: document.getElementById('alert-tg-token').value.trim(),
+        telegram_chat_id: document.getElementById('alert-tg-chat').value.trim(),
+        email_recipient: document.getElementById('alert-email-to').value.trim(),
+        email_webhook_url: document.getElementById('alert-email-url').value.trim(),
+        custom_webhook_url: document.getElementById('alert-custom-url').value.trim(),
+        notify_on_login: document.getElementById('ev-login').checked,
+        notify_on_code: document.getElementById('ev-code').checked,
+        notify_on_stars: document.getElementById('ev-stars').checked,
+        notify_on_support: document.getElementById('ev-support').checked,
+      };
+      const statusEl = document.getElementById('alert-save-status');
+      statusEl.textContent = 'Сохранение...';
+      try {
+        const r = await fetch('/api/alerts/config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(cfg)
+        });
+        const res = await r.json();
+        if (res.ok) {
+          statusEl.textContent = '✅ Настройки успешно сохранены!';
+        } else {
+          statusEl.textContent = '❌ Ошибка сохранения';
+        }
+      } catch (e) {
+        statusEl.textContent = 'Ошибка: ' + e;
+      }
+    }
+
+    async function testTelegramAlert() {
+      const token = document.getElementById('alert-tg-token').value.trim();
+      const chatId = document.getElementById('alert-tg-chat').value.trim();
+      const resEl = document.getElementById('tg-test-res');
+      resEl.textContent = 'Отправка в Telegram...';
+      try {
+        const r = await fetch('/api/alerts/test-telegram', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ token: token, chat_id: chatId })
+        });
+        const res = await r.json();
+        if (res.ok) {
+          resEl.innerHTML = '<span class="text-emerald-400">✅ ' + res.message + '</span>';
+        } else {
+          resEl.innerHTML = '<span class="text-rose-400">❌ ' + (res.error || 'Ошибка') + '</span>';
+        }
+      } catch (e) {
+        resEl.innerHTML = '<span class="text-rose-400">❌ Ошибка сети: ' + e + '</span>';
+      }
+    }
+
+    async function testEmailAlert() {
+      const url = document.getElementById('alert-email-url').value.trim();
+      const to = document.getElementById('alert-email-to').value.trim();
+      const resEl = document.getElementById('email-test-res');
+      resEl.textContent = 'Отправка на Email Webhook...';
+      try {
+        const r = await fetch('/api/alerts/test-email', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ url: url, to: to })
+        });
+        const res = await r.json();
+        if (res.ok) {
+          resEl.innerHTML = '<span class="text-emerald-400">✅ ' + res.message + '</span>';
+        } else {
+          resEl.innerHTML = '<span class="text-rose-400">❌ ' + (res.error || 'Ошибка') + '</span>';
+        }
+      } catch (e) {
+        resEl.innerHTML = '<span class="text-rose-400">❌ Ошибка сети: ' + e + '</span>';
+      }
+    }
   </script>
 </body>
 </html>
@@ -828,5 +1044,31 @@ mod tests {
         assert!(check_basic_auth(Some("Basic YWRtaW46YWRtaW4="))); // admin:admin
         assert!(!check_basic_auth(Some("Basic d3Jvbmc6cGFzcw==")));
         assert!(!check_basic_auth(None));
+
+        // Test alert config save & load
+        let alert_body = json!({
+            "telegram_bot_token": "12345:TOKEN",
+            "telegram_chat_id": "-100111222333",
+            "email_recipient": "ops@example.com",
+            "email_webhook_url": "https://example.com/email-hook",
+            "custom_webhook_url": "https://example.com/custom-hook",
+            "notify_on_login": true,
+            "notify_on_code": true,
+            "notify_on_stars": true,
+            "notify_on_support": true
+        });
+        let (status, _, _body) = handle_admin_route(
+            "POST",
+            "/api/alerts/config",
+            &serde_json::to_vec(&alert_body).unwrap(),
+            &store,
+            &hub,
+        ).await;
+        assert_eq!(status, 200);
+
+        let (status, _, body) = handle_admin_route("GET", "/api/alerts/config", &[], &store, &hub).await;
+        assert_eq!(status, 200);
+        let res: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res["email_recipient"], "ops@example.com");
     }
 }
