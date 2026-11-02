@@ -3555,6 +3555,235 @@ impl Dispatcher {
         w.write_i32(now_unix());
         w.into_vec()
     }
+
+    // phone.requestCall#42ff964e flags:# video:flags.0?true user_id:InputUser random_id:int g_a_hash:bytes protocol:PhoneCallProtocol = phone.PhoneCall;
+    pub fn phone_request_call(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let target_uid = match self.resolve_input_user(ctx, r) {
+            Ok(Some(u)) => u.id,
+            _ => me.id,
+        };
+        let _random_id = r.read_i32();
+        let _g_a_hash = r.read_bytes();
+
+        let call_id = rand::random::<i64>().abs().max(1);
+        let access_hash = rand::random::<i64>().abs();
+
+        let mut w = Writer::new();
+        w.write_u32(0xec82_e140); // phone.phoneCall#ec82e140
+        w.write_u32(0xc522_6f17); // phoneCallWaiting#c5226f17
+        w.write_i32(if (flags & 1) != 0 { 1 << 6 } else { 0 }); // video flag
+        w.write_i64(call_id);
+        w.write_i64(access_hash);
+        w.write_i32(now_unix());
+        w.write_i64(me.id);
+        w.write_i64(target_uid);
+        w.write_u32(0xfc87_8fc8); // PhoneCallProtocol
+        w.write_i32(3); // udp_p2p | udp_reflector
+        w.write_i32(65);
+        w.write_i32(93);
+        w.write_vector_header(1);
+        w.write_string("3.0.0");
+
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        w.write_vector_header(1);
+        w.write_raw(&me_tl);
+        w.into_vec()
+    }
+
+    // phone.acceptCall#3bd2b4a0 peer:InputPhoneCall g_b:bytes protocol:PhoneCallProtocol = phone.PhoneCall;
+    pub fn phone_accept_call(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _ctor = r.read_u32();
+        let call_id = r.read_i64().unwrap_or(1);
+        let access_hash = r.read_i64().unwrap_or(0);
+        let g_b = r.read_bytes().unwrap_or_default();
+
+        let mut w = Writer::new();
+        w.write_u32(0xec82_e140); // phone.phoneCall#ec82e140
+        w.write_u32(0x997c_454a); // phoneCallAccepted#997c454a
+        w.write_i32(0); // flags
+        w.write_i64(call_id);
+        w.write_i64(access_hash);
+        w.write_i32(now_unix());
+        w.write_i64(me.id);
+        w.write_i64(me.id);
+        w.write_bytes(g_b);
+        w.write_u32(0xfc87_8fc8); // PhoneCallProtocol
+        w.write_i32(3);
+        w.write_i32(65);
+        w.write_i32(93);
+        w.write_vector_header(1);
+        w.write_string("3.0.0");
+
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        w.write_vector_header(1);
+        w.write_raw(&me_tl);
+        w.into_vec()
+    }
+
+    // phone.confirmCall#2efe1722 peer:InputPhoneCall g_a:bytes key_fingerprint:long protocol:PhoneCallProtocol = phone.PhoneCall;
+    pub fn phone_confirm_call(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _ctor = r.read_u32();
+        let call_id = r.read_i64().unwrap_or(1);
+        let access_hash = r.read_i64().unwrap_or(0);
+        let g_a = r.read_bytes().unwrap_or_default();
+        let key_fingerprint = r.read_i64().unwrap_or(0);
+
+        let mut w = Writer::new();
+        w.write_u32(0xec82_e140);
+        w.write_u32(0x8741_893a); // phoneCall#8741893a
+        w.write_i32(1 << 5); // p2p_allowed = true
+        w.write_i64(call_id);
+        w.write_i64(access_hash);
+        w.write_i32(now_unix());
+        w.write_i64(me.id);
+        w.write_i64(me.id);
+        w.write_bytes(g_a);
+        w.write_i64(key_fingerprint);
+        w.write_u32(0xfc87_8fc8); // PhoneCallProtocol
+        w.write_i32(3);
+        w.write_i32(65);
+        w.write_i32(93);
+        w.write_vector_header(1);
+        w.write_string("3.0.0");
+        w.write_vector_header(0);
+        w.write_i32(now_unix());
+
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        w.write_vector_header(1);
+        w.write_raw(&me_tl);
+        w.into_vec()
+    }
+
+    // phone.discardCall#b2cbc1c0 flags:# video:flags.0?true peer:InputPhoneCall duration:int reason:PhoneCallDiscardReason connection_id:long = Updates;
+    pub fn phone_discard_call(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _flags = r.read_i32().unwrap_or(0);
+        let _ctor = r.read_u32();
+        let call_id = r.read_i64().unwrap_or(1);
+        let _access_hash = r.read_i64().unwrap_or(0);
+        let duration = r.read_i32().unwrap_or(0);
+
+        let mut w = Writer::new();
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(1);
+        w.write_u32(0xab0f_6b1e); // updatePhoneCall#ab0f6b1e
+        w.write_u32(0x50ca_4de1); // phoneCallDiscarded#50ca4de1
+        w.write_i32(1 << 0 | 1 << 1);
+        w.write_i64(call_id);
+        w.write_u32(0x57ad_c690); // phoneCallDiscardReasonHangup
+        w.write_i32(duration);
+
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(now_unix());
+        w.write_i32(0);
+        w.into_vec()
+    }
+
+    // phone.receivedCall#03cd2c4f peer:InputPhoneCall = Bool;
+    pub fn phone_received_call(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_BOOL_TRUE);
+        w.into_vec()
+    }
+
+    // phone.createGroupCall#48cdc6d8 flags:# peer:InputPeer random_id:int title:flags.0?string schedule_date:flags.1?int = Updates;
+    pub fn phone_create_group_call(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let _flags = r.read_i32().unwrap_or(0);
+        let target_peer = parse_input_peer(r, Some(me.id)).ok().flatten();
+        let _random_id = r.read_i32();
+
+        let call_id = rand::random::<i64>().abs().max(1);
+        let access_hash = rand::random::<i64>().abs();
+
+        let mut w = Writer::new();
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(1);
+        w.write_u32(0x14b4_a003); // updateGroupCall#14b4a003
+        w.write_i32(0); // flags
+        if let Some(peer) = target_peer {
+            peer.write_tl(&mut w);
+        } else {
+            w.write_u32(TL_PEER_USER);
+            w.write_i64(me.id);
+        }
+        w.write_u32(0xefb2_b617); // groupCall#efb2b617
+        w.write_i32(1 << 9 | 1 << 15); // can_start_video | creator
+        w.write_i64(call_id);
+        w.write_i64(access_hash);
+        w.write_i32(1); // participants_count
+        w.write_i32(1); // version
+
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(now_unix());
+        w.write_i32(0);
+        w.into_vec()
+    }
+
+    // phone.getGroupCall#4124c6e6 call:InputGroupCall limit:int = phone.GroupCall;
+    pub fn phone_get_group_call(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _ctor = r.read_u32();
+        let call_id = r.read_i64().unwrap_or(1);
+        let access_hash = r.read_i64().unwrap_or(0);
+
+        let mut w = Writer::new();
+        w.write_u32(0x9e72_7aad); // phone.groupCall#9e727aad
+        w.write_u32(0xefb2_b617); // groupCall#efb2b617
+        w.write_i32(1 << 9 | 1 << 15);
+        w.write_i64(call_id);
+        w.write_i64(access_hash);
+        w.write_i32(1); // participants_count
+        w.write_i32(1); // version
+
+        w.write_vector_header(0);
+        w.write_string("");
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(1);
+        w.into_vec()
+    }
+
+    // phone.getGroupParticipants#c555c853 call:InputGroupCall ids:Vector<InputPeer> sources:Vector<int> offset:string limit:int = phone.GroupParticipants;
+    pub fn phone_get_group_participants(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xf477_51b6); // phone.groupParticipants#f47751b6
+        w.write_i32(0);
+        w.write_vector_header(0);
+        w.write_string("");
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(1);
+        w.into_vec()
+    }
+
+    // phone.joinGroupCall#b132ff7b / phone.leaveGroupCall#500377f9
+    pub fn phone_join_leave_group_call(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x74ae_4240); // updates#74ae4240
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_vector_header(0);
+        w.write_i32(now_unix());
+        w.write_i32(0);
+        w.into_vec()
+    }
 }
 
 fn parse_input_file(r: &mut Reader) -> Option<(i64, usize, String)> {

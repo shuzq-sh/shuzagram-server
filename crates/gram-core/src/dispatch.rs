@@ -716,6 +716,17 @@ impl Dispatcher {
             0x8d96_92a3 => self.messages_get_web_page(ctx, r), // messages.getWebPage
             0x8c4b_fe5d => self.messages_get_outbox_read_date(ctx, r), // messages.getOutboxReadDate
 
+            // VoIP 1:1 Calls & Group Voice/Video Chats
+            0x42ff_964e => self.phone_request_call(ctx, r), // phone.requestCall
+            0x3bd2_b4a0 => self.phone_accept_call(ctx, r), // phone.acceptCall
+            0x2efe_1722 => self.phone_confirm_call(ctx, r), // phone.confirmCall
+            0xb2cb_c1c0 => self.phone_discard_call(ctx, r), // phone.discardCall
+            0x03cd_2c4f => self.phone_received_call(ctx, r), // phone.receivedCall
+            0x48cd_c6d8 => self.phone_create_group_call(ctx, r), // phone.createGroupCall
+            0x4124_c6e6 => self.phone_get_group_call(ctx, r), // phone.getGroupCall
+            0xc555_c853 => self.phone_get_group_participants(ctx, r), // phone.getGroupParticipants
+            0xb132_ff7b | 0x5003_77f9 => self.phone_join_leave_group_call(ctx, r), // phone.joinGroupCall / leaveGroupCall
+
             0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
             0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername
             0x3e0b_dd7c => self.account_update_username(ctx, r),  // account.updateUsername
@@ -1054,7 +1065,7 @@ impl Dispatcher {
         self.resolve_input_user(ctx, r)
     }
 
-    fn resolve_input_user(&self, ctx: &ConnContext, r: &mut Reader) -> Result<Option<User>, TlError> {
+    pub(crate) fn resolve_input_user(&self, ctx: &ConnContext, r: &mut Reader) -> Result<Option<User>, TlError> {
         let ctor = r.read_u32()?;
         match ctor {
             INPUT_USER_EMPTY => Ok(None),
