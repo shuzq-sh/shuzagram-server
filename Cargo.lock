@@ -120,6 +120,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gram-edge"
+version = "0.1.0"
+dependencies = [
+ "mtproto-crypto",
+ "num-bigint-dig",
+ "rand",
+ "thiserror",
+ "tl-core",
+]
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +475,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tl-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "thiserror",
 ]
 
 [[package]]

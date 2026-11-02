@@ -13,11 +13,50 @@ use num_traits::One;
 
 use crate::CryptoError;
 
+/// RFC 3526 MODP group 14: a 2048-bit safe prime with generator 2, usable as
+/// the server's `dh_prime` (it satisfies `p mod 8 == 7`, so g = 2 is valid).
+pub const MODP14_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
+EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
+E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D\
+C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F\
+83655D23DCA3AD961C62F356208552BB9ED529077096966D\
+670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B\
+E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9\
+DE2BCBF6955817183995497CEA956AE515D2261898FA0510\
+15728E5A8AACAA68FFFFFFFFFFFFFFFF";
+
 /// A DH configuration: the safe prime `p` and generator `g`.
 #[derive(Clone, Debug)]
 pub struct DhParams {
     pub prime: BigUint,
     pub g: u32,
+}
+
+/// The server's default DH parameters (MODP-14, g = 2).
+pub fn server_default() -> DhParams {
+    let mut bytes = [0u8; 256];
+    let mut i = 0;
+    let mut out = 0;
+    let h = MODP14_HEX.as_bytes();
+    while i + 1 < h.len() {
+        let hi = hex_nibble(h[i]);
+        let lo = hex_nibble(h[i + 1]);
+        bytes[out] = (hi << 4) | lo;
+        out += 1;
+        i += 2;
+    }
+    DhParams::from_be_bytes(&bytes, 2)
+}
+
+const fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
 }
 
 impl DhParams {

@@ -1,0 +1,19 @@
+[package]
+name = "gram-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MTProto transport gateway and DH handshake"
+
+[dependencies]
+tl-core = { path = "../tl-core" }
+mtproto-crypto = { path = "../mtproto-crypto" }
+num-bigint-dig.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "gram-edge"
+path = "src/main.rs"

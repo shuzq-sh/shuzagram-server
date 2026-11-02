@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/mtproto-crypto",
+    "crates/tl-core",
+    "crates/gram-edge",
 ]
 
 [workspace.package]
