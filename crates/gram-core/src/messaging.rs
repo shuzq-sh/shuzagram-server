@@ -3178,7 +3178,12 @@ impl Dispatcher {
     pub fn payments_get_star_gifts(&self, _ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
         let hash = r.read_i32().unwrap_or(0);
         let catalog = self.store().acid().list_gift_catalog();
-        if hash != 0 && !catalog.is_empty() {
+        let mut computed_hash: i32 = 0;
+        for item in &catalog {
+            computed_hash = computed_hash.wrapping_add((item.gift_id as i32).wrapping_mul(item.star_price_units as i32));
+        }
+
+        if hash != 0 && hash == computed_hash && !catalog.is_empty() {
             let mut w = Writer::new();
             w.write_u32(0xa388_a368); // payments.starGiftsNotModified#a388a368
             return w.into_vec();
@@ -3186,7 +3191,7 @@ impl Dispatcher {
         let mut w = Writer::new();
         // payments.starGifts#2ed82995 hash:int gifts:Vector<StarGift> chats:Vector<Chat> users:Vector<User> = payments.StarGifts;
         w.write_u32(0x2ed8_2995);
-        w.write_i32(12345); // hash
+        w.write_i32(computed_hash); // hash
         w.write_vector_header(catalog.len());
         for item in &catalog {
             // starGift#313a9547
@@ -3200,9 +3205,34 @@ impl Dispatcher {
             }
             w.write_i32(flags);
             w.write_i64(item.gift_id);
-            // Dummy sticker Document (documentEmpty#36f8c871 id:long)
-            w.write_u32(0x36f8_c871);
+            // Full Document (document#8fd4c4d8) so client renders the visual gift card!
+            w.write_u32(0x8fd4_c4d8); // document#8fd4c4d8
+            w.write_i32(0); // flags: no thumbs, no video_thumbs
             w.write_i64(item.gift_id);
+            let ahash = item.gift_id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+            w.write_i64(ahash);
+            w.write_bytes(&[]); // file_reference
+            w.write_i32(1730000000); // date
+            // Mime/size come from the real stored sticker blob (if present) so the
+            // client downloads actual bytes via upload.getFile; else a placeholder.
+            let (gift_mime, gift_size) = match self.store().acid().get_media_blob(item.gift_id) {
+                Some(b) => (b.mime_type, b.byte_size),
+                None => ("application/x-tgsticker".to_string(), 1024),
+            };
+            w.write_string(&gift_mime); // mime_type
+            w.write_i64(gift_size); // size
+            w.write_i32(2); // dc_id
+            w.write_vector_header(2); // attributes
+            // 1. image size
+            w.write_u32(0x6c37_c15c); // documentAttributeImageSize
+            w.write_i32(512); // w
+            w.write_i32(512); // h
+            // 2. sticker attribute
+            w.write_u32(0x6319_d612); // documentAttributeSticker
+            w.write_i32(0); // flags
+            w.write_string("⭐️"); // alt
+            w.write_u32(0xffb6_2b95); // inputStickerSetEmpty
+
             w.write_i64(item.star_price_units);
             if item.is_limited {
                 let remains = (item.total_supply.unwrap_or(1000) - item.minted_count).max(0);
@@ -3217,6 +3247,30 @@ impl Dispatcher {
         }
         w.write_vector_header(0); // chats
         w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // payments.getStarsGiftOptions#d3c96bc8 flags:# user_id:flags.0?InputUser = Vector<StarsGiftOption>;
+    pub fn payments_get_stars_gift_options(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x1cb5_c415); // VECTOR
+        let tiers: &[(i64, i64, &str)] = &[
+            (50, 99, "com.telegram.stars.50"),
+            (100, 199, "com.telegram.stars.100"),
+            (250, 499, "com.telegram.stars.250"),
+            (500, 999, "com.telegram.stars.500"),
+            (1000, 1999, "com.telegram.stars.1000"),
+            (2500, 4999, "com.telegram.stars.2500"),
+        ];
+        w.write_i32(tiers.len() as i32);
+        for &(stars, amount_cents, product) in tiers {
+            w.write_u32(0x5e05_89f1); // starsGiftOption#5e0589f1
+            w.write_i32(1); // flags: store_product
+            w.write_i64(stars);
+            w.write_string(product);
+            w.write_string("USD");
+            w.write_i64(amount_cents);
+        }
         w.into_vec()
     }
 
@@ -3782,6 +3836,44 @@ impl Dispatcher {
         w.write_vector_header(0);
         w.write_i32(now_unix());
         w.write_i32(0);
+        w.into_vec()
+    }
+
+    // account.getReactionsNotifySettings#06dd654c = ReactionsNotifySettings
+    pub fn account_get_reactions_notify_settings(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x71e4_ea58); // reactionsNotifySettings#71e4ea58
+        w.write_i32(0); // flags
+        w.write_u32(0x97e8_bebe); // notificationSoundDefault#97e8bebe
+        w.write_u32(TL_BOOL_TRUE); // show_previews
+        w.into_vec()
+    }
+
+    // help.getInviteText#4d392343 = help.InviteText
+    pub fn help_get_invite_text(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x18cb_9f78); // help.inviteText#18cb9f78
+        w.write_string("Join me on ShuzaGram!");
+        w.into_vec()
+    }
+
+    // contacts.getBirthdays#daeda864 = contacts.ContactBirthdays
+    pub fn contacts_get_birthdays(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x114f_f30d); // contacts.contactBirthdays#114ff30d
+        w.write_vector_header(0); // contacts
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    // messages.getDefaultTagReactions#bdf93428 = messages.Reactions
+    pub fn messages_get_default_tag_reactions(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0xeafc_32bc); // messages.reactions#eafc32bc
+        w.write_i64(0); // hash
+        w.write_vector_header(0); // reactions
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
         w.into_vec()
     }
 }

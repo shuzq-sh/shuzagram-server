@@ -996,7 +996,7 @@ mod tests {
         let (status, _, body) = handle_admin_route("GET", "/api/economy/catalog", &[], &store, &hub).await;
         assert_eq!(status, 200);
         let res: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(res.as_array().unwrap().len(), 3);
+        assert!(res.as_array().unwrap().len() >= 3);
 
         // Test users list and adjust-stars
         let user = store.get_or_create_user("+12025550100", Some("Bob"), None);

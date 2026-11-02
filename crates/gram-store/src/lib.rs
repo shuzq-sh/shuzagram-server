@@ -606,14 +606,9 @@ impl AcidStore {
         let catalog_count: i64 =
             db.query_row("SELECT COUNT(*) FROM gifts_catalog", [], |r| r.get(0))?;
         if catalog_count == 0 {
-            db.execute(
-                "INSERT INTO gifts_catalog (gift_id, slug_prefix, title, star_price_units, upgrade_price_units, convert_units, total_supply, is_limited, is_upgradeable)
-                 VALUES
-                 (5001, 'CrystalStar', 'Crystal Star', 50, 25, 40, 10000, 1, 1),
-                 (5002, 'NeonCrown', 'Neon Crown', 250, 50, 200, 1000, 1, 1),
-                 (5003, 'CyberRose', 'Cyber Rose', 25, 25, 20, NULL, 0, 1)",
-                [],
-            )?;
+            // Real Telegram Star Gifts catalog (151 gifts), scraped 2026-11-02 and
+            // embedded from data/gifts_catalog_seed.sql (stickers in shuzagram-assets/gifts).
+            db.execute_batch(include_str!("../data/gifts_catalog_seed.sql"))?;
         }
 
         // Seed official Telegram Service Notifications account (777000)

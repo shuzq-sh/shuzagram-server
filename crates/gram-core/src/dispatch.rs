@@ -705,6 +705,11 @@ impl Dispatcher {
             0xd483_f2a8 => self.messages_get_quick_replies(ctx, r), // messages.getQuickReplies
             0x2757_ba54 => self.payments_get_premium_gift_code_options(ctx, r), // payments.getPremiumGiftCodeOptions
             0xc456_3590 => self.payments_get_star_gifts(ctx, r), // payments.getStarGifts
+            0xd3c9_6bc8 => self.payments_get_stars_gift_options(ctx, r), // payments.getStarsGiftOptions
+            0x06dd_654c => self.account_get_reactions_notify_settings(ctx, r), // account.getReactionsNotifySettings
+            0x4d39_2343 => self.help_get_invite_text(ctx, r), // help.getInviteText
+            0xdaed_a864 => self.contacts_get_birthdays(ctx, r), // contacts.getBirthdays
+            0xbdf9_3428 => self.messages_get_default_tag_reactions(ctx, r), // messages.getDefaultTagReactions
             0xd5a5_d3a1 => self.messages_get_stickers(ctx, r), // messages.getStickers
             0xa1b7_0815 => self.bots_get_bot_recommendations(ctx, r), // bots.getBotRecommendations
             0x5821_a5dc => self.stories_get_pinned_stories(ctx, r), // stories.getPinnedStories
@@ -1268,9 +1273,58 @@ fn countries_list(r: &mut Reader) -> Vec<u8> {
 fn app_config() -> Vec<u8> {
     let mut w = Writer::new();
     w.write_u32(HELP_APP_CONFIG);
-    w.write_i32(1); // hash
+    w.write_i32(now_unix()); // hash
     w.write_u32(JSON_OBJECT);
-    w.write_vector_header(0);
+    w.write_vector_header(8);
+
+    // 1. stars_gifts_enabled - REQUIRED by Telegram clients to show the Star Gifts catalog!
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_gifts_enabled");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 2. stars_paid_reactions_enabled
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_paid_reactions_enabled");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 3. stars_subscriptions_enabled
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_subscriptions_enabled");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 4. stars_revenue_withdrawal_enabled
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_revenue_withdrawal_enabled");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 5. giveaway_gifts_enabled
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("giveaway_gifts_enabled");
+    w.write_u32(JSON_BOOL);
+    w.write_bool(true);
+
+    // 6. stars_usd_rate
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("stars_usd_rate");
+    w.write_u32(JSON_NUMBER);
+    w.write_f64(0.013);
+
+    // 7. saved_star_gifts_limit_default
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("saved_star_gifts_limit_default");
+    w.write_u32(JSON_NUMBER);
+    w.write_f64(100.0);
+
+    // 8. saved_star_gifts_limit_premium
+    w.write_u32(JSON_OBJECT_VALUE);
+    w.write_string("saved_star_gifts_limit_premium");
+    w.write_u32(JSON_NUMBER);
+    w.write_f64(1000.0);
+
     w.into_vec()
 }
 
