@@ -36,6 +36,26 @@ const USER: u32 = 0xb1b8_cc83;
 const CONFIG: u32 = 0xcc1a_241e;
 const DC_OPTION: u32 = 0x18b7_a10d;
 
+// Post-login methods and their replies.
+const UPDATES_GET_STATE: u32 = 0xedd4_882a;
+const UPDATES_STATE: u32 = 0xa56c_2a3e;
+const MESSAGES_GET_DIALOGS: u32 = 0xa0f4_cb4f;
+const MESSAGES_DIALOGS: u32 = 0x15ba_6c40;
+const USERS_GET_USERS: u32 = 0x0d91_a548;
+const ACCOUNT_UPDATE_STATUS: u32 = 0x6628_562c;
+const CONTACTS_GET_CONTACTS: u32 = 0x5dd6_9e12;
+const CONTACTS_CONTACTS_NOT_MODIFIED: u32 = 0xb74b_a9d2;
+
+// Service messages that need no reply.
+const MSGS_ACK: u32 = 0x62d6_b459;
+const HTTP_WAIT: u32 = 0x9299_359f;
+
+/// Per-connection state threaded through dispatch (who is logged in).
+#[derive(Default)]
+pub struct ConnContext {
+    pub user: Option<User>,
+}
+
 /// One object to send back to the client; the caller encrypts it.
 pub type Response = Vec<u8>;
 
@@ -80,14 +100,19 @@ impl Dispatcher {
     /// Handle one decrypted inbound message body, returning zero or more reply
     /// objects (each already in the form the client expects: a `pong`, or an
     /// `rpc_result` wrapping the query's result).
-    pub fn handle_message(&self, msg_id: i64, body: &[u8]) -> Vec<Response> {
+    pub fn handle_message(&self, ctx: &mut ConnContext, msg_id: i64, body: &[u8]) -> Vec<Response> {
         let mut r = Reader::new(body);
         let Ok(id) = r.read_u32() else {
             return vec![];
         };
 
         if id == MSG_CONTAINER {
-            return self.handle_container(&mut r);
+            return self.handle_container(ctx, &mut r);
+        }
+
+        // Service messages that expect no reply.
+        if id == MSGS_ACK || id == HTTP_WAIT {
+            return vec![];
         }
 
         // Unwrap invokeWithLayer / initConnection down to the real query.
@@ -106,11 +131,11 @@ impl Dispatcher {
             return vec![pong(msg_id, ping_id)];
         }
 
-        let result = self.dispatch_query(qid, &mut qr);
+        let result = self.dispatch_query(ctx, qid, &mut qr);
         vec![rpc_result(msg_id, &result)]
     }
 
-    fn handle_container(&self, r: &mut Reader) -> Vec<Response> {
+    fn handle_container(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<Response> {
         let Ok(count) = r.read_u32() else {
             return vec![];
         };
@@ -125,18 +150,23 @@ impl Dispatcher {
             let Ok(inner_body) = r.read_raw(len as usize) else {
                 break;
             };
-            out.extend(self.handle_message(inner_msg_id, inner_body));
+            out.extend(self.handle_message(ctx, inner_msg_id, inner_body));
         }
         out
     }
 
     /// Dispatch a single query, returning the result object (a success object or
     /// an `rpc_error`), to be wrapped in `rpc_result` by the caller.
-    fn dispatch_query(&self, qid: u32, r: &mut Reader) -> Vec<u8> {
+    fn dispatch_query(&self, ctx: &mut ConnContext, qid: u32, r: &mut Reader) -> Vec<u8> {
         match qid {
             AUTH_SEND_CODE => self.auth_send_code(r),
-            AUTH_SIGN_IN => self.auth_sign_in(r),
+            AUTH_SIGN_IN => self.auth_sign_in(ctx, r),
             HELP_GET_CONFIG => config(&self.dc),
+            UPDATES_GET_STATE => updates_state(),
+            MESSAGES_GET_DIALOGS => messages_dialogs_empty(),
+            USERS_GET_USERS => users_get_users(ctx),
+            ACCOUNT_UPDATE_STATUS => bool_result(true),
+            CONTACTS_GET_CONTACTS => contacts_not_modified(),
             other => rpc_error(400, &format!("UNKNOWN_METHOD_{other:#010x}")),
         }
     }
@@ -165,7 +195,7 @@ impl Dispatcher {
     }
 
     // auth.signIn flags:# phone_number:string phone_code_hash:string phone_code:flags.0?string
-    fn auth_sign_in(&self, r: &mut Reader) -> Vec<u8> {
+    fn auth_sign_in(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
         let Ok(flags) = r.read_i32() else {
             return rpc_error(400, "SIGN_IN_MALFORMED");
         };
@@ -179,21 +209,79 @@ impl Dispatcher {
         };
 
         match self.store.check_code(hash, code) {
-            Some(user) => authorization(&user),
+            Some(user) => {
+                ctx.user = Some(user.clone()); // remember who is logged in
+                authorization(&user)
+            }
             None => rpc_error(400, "PHONE_CODE_INVALID"),
         }
     }
+}
+
+/// updates.state with an empty/initial state.
+fn updates_state() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(UPDATES_STATE);
+    w.write_i32(0); // pts
+    w.write_i32(0); // qts
+    w.write_i32(now_unix()); // date
+    w.write_i32(0); // seq
+    w.write_i32(0); // unread_count
+    w.into_vec()
+}
+
+/// messages.dialogs with four empty vectors (no chats yet).
+fn messages_dialogs_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(MESSAGES_DIALOGS);
+    for _ in 0..4 {
+        w.write_vector_header(0); // dialogs, messages, chats, users
+    }
+    w.into_vec()
+}
+
+/// users.getUsers -> Vector<User> containing the logged-in user (if any).
+fn users_get_users(ctx: &ConnContext) -> Vec<u8> {
+    let mut w = Writer::new();
+    match &ctx.user {
+        Some(user) => {
+            w.write_vector_header(1);
+            w.write_raw(&encode_user(user));
+        }
+        None => w.write_vector_header(0),
+    }
+    w.into_vec()
+}
+
+/// contacts.contactsNotModified.
+fn contacts_not_modified() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(CONTACTS_CONTACTS_NOT_MODIFIED);
+    w.into_vec()
+}
+
+/// A bare Bool result.
+fn bool_result(v: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_bool(v);
+    w.into_vec()
 }
 
 /// Peel `invokeWithLayer` / `initConnection` wrappers, returning the inner query
 /// bytes (including its constructor id). `id` is the already-read first id and
 /// `r` is positioned just after it.
 fn peel_wrappers(mut id: u32, r: &mut Reader) -> Result<Vec<u8>, TlError> {
+    const INVOKE_AFTER_MSG: u32 = 0xcb9f_372d; // invokeAfterMsg msg_id:long query
+    const INVOKE_WITHOUT_UPDATES: u32 = 0xbf94_59b7; // invokeWithoutUpdates query
     loop {
         match id {
             INVOKE_WITH_LAYER => {
                 let _layer = r.read_i32()?;
             }
+            INVOKE_AFTER_MSG => {
+                let _after = r.read_i64()?;
+            }
+            INVOKE_WITHOUT_UPDATES => {}
             INIT_CONNECTION => {
                 let flags = r.read_i32()?;
                 let _api_id = r.read_i32()?;
@@ -452,7 +540,8 @@ mod tests {
         q.write_i64(0x1234);
         let msg = invoke_with_layer(&q.into_vec());
 
-        let out = d.handle_message(777, &msg);
+        let mut ctx = ConnContext::default();
+        let out = d.handle_message(&mut ctx, 777, &msg);
         assert_eq!(out.len(), 1);
         let mut r = Reader::new(&out[0]);
         assert_eq!(r.read_u32().unwrap(), PONG);
@@ -467,7 +556,8 @@ mod tests {
 
         let mut q = Writer::new();
         q.write_u32(HELP_GET_CONFIG);
-        let out = d.handle_message(5, &invoke_with_layer(&q.into_vec()));
+        let mut ctx = ConnContext::default();
+        let out = d.handle_message(&mut ctx, 5, &invoke_with_layer(&q.into_vec()));
         let (_req, result) = unwrap_rpc_result(&out[0]);
 
         // Parse it exactly as the client's TL_config.readParams would (flags=0),
@@ -506,6 +596,7 @@ mod tests {
     fn full_login_flow() {
         let store = Arc::new(Store::new());
         let d = Dispatcher::new(store);
+        let mut ctx = ConnContext::default();
 
         // 1) auth.sendCode
         let mut sc = Writer::new();
@@ -513,7 +604,7 @@ mod tests {
         sc.write_string("+99900099999");
         sc.write_i32(12345);
         sc.write_string("apihash");
-        let out = d.handle_message(10, &invoke_with_layer(&sc.into_vec()));
+        let out = d.handle_message(&mut ctx, 10, &invoke_with_layer(&sc.into_vec()));
         let (req, result) = unwrap_rpc_result(&out[0]);
         assert_eq!(req, 10);
         let hash = decode_sent_code(&result);
@@ -521,17 +612,48 @@ mod tests {
 
         // 2a) auth.signIn with the wrong code -> PHONE_CODE_INVALID
         let bad = build_sign_in("+99900099999", &hash, "00000");
-        let out = d.handle_message(11, &invoke_with_layer(&bad));
+        let out = d.handle_message(&mut ctx, 11, &invoke_with_layer(&bad));
         let (_, result) = unwrap_rpc_result(&out[0]);
         assert_eq!(is_rpc_error(&result).unwrap().1, "PHONE_CODE_INVALID");
 
         // 2b) auth.signIn with the correct code -> authorization + user
         let ok = build_sign_in("+99900099999", &hash, "22222");
-        let out = d.handle_message(12, &invoke_with_layer(&ok));
+        let out = d.handle_message(&mut ctx, 12, &invoke_with_layer(&ok));
         let (_, result) = unwrap_rpc_result(&out[0]);
         let user = decode_authorization(&result);
         assert_eq!(user.phone, "+99900099999");
         assert!(user.id >= 1000);
+
+        // 3) post-login: the main screen RPCs must return valid objects.
+        let mut q = Writer::new();
+        q.write_u32(UPDATES_GET_STATE);
+        let (_, result) = unwrap_rpc_result(&d.handle_message(&mut ctx, 13, &q.into_vec())[0]);
+        assert_eq!(Reader::new(&result).read_u32().unwrap(), UPDATES_STATE);
+
+        let mut q = Writer::new();
+        q.write_u32(MESSAGES_GET_DIALOGS);
+        let (_, result) = unwrap_rpc_result(&d.handle_message(&mut ctx, 14, &q.into_vec())[0]);
+        let mut rr = Reader::new(&result);
+        assert_eq!(rr.read_u32().unwrap(), MESSAGES_DIALOGS);
+        for _ in 0..4 {
+            assert_eq!(rr.read_vector_header().unwrap(), 0); // all empty
+        }
+
+        // users.getUsers returns the logged-in user from the connection context.
+        let mut q = Writer::new();
+        q.write_u32(USERS_GET_USERS);
+        q.write_vector_header(1);
+        q.write_u32(0xf7c1b13f); // inputUserSelf (value irrelevant to the stub)
+        let (_, result) = unwrap_rpc_result(&d.handle_message(&mut ctx, 15, &q.into_vec())[0]);
+        let mut rr = Reader::new(&result);
+        assert_eq!(rr.read_vector_header().unwrap(), 1);
+        assert_eq!(rr.read_u32().unwrap(), USER);
+
+        // A msgs_ack produces no reply.
+        let mut ack = Writer::new();
+        ack.write_u32(MSGS_ACK);
+        ack.write_long_vector(&[1, 2, 3]);
+        assert!(d.handle_message(&mut ctx, 16, &ack.into_vec()).is_empty());
     }
 
     fn build_sign_in(phone: &str, hash: &str, code: &str) -> Vec<u8> {
@@ -611,7 +733,8 @@ mod tests {
         // --- server decrypts, dispatches, encrypts the reply ---
         let incoming = server.decrypt(&enc).unwrap();
         assert_eq!(incoming.msg_id, client_msg_id);
-        let replies = dispatcher.handle_message(incoming.msg_id, &incoming.body);
+        let mut ctx = ConnContext::default();
+        let replies = dispatcher.handle_message(&mut ctx, incoming.msg_id, &incoming.body);
         assert_eq!(replies.len(), 1);
         let seq = server.next_content_seq();
         let reply_enc = server.encrypt(0x7000_0000_0000_0001, seq, &replies[0]);

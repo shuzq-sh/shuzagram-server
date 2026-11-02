@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gram_core::dispatch::ConnContext;
 use gram_core::{Dispatcher, Session};
 use mtproto_crypto::dh::DhParams;
 use mtproto_crypto::rsa_key::ServerRsaKey;
@@ -63,6 +64,7 @@ pub fn serve_connection(
     // Phase 2: authenticated session — handle encrypted RPCs (auth.sendCode,
     // auth.signIn, ping, …) until the client disconnects.
     let mut session = Session::new(auth_key, server_salt, 0);
+    let mut ctx = ConnContext::default();
     loop {
         let payload = match read_frame(&mut sock, transport) {
             Ok(p) => p,
@@ -76,7 +78,7 @@ pub fn serve_connection(
         if session.session_id == 0 {
             session.session_id = incoming.session_id;
         }
-        for reply in dispatcher.handle_message(incoming.msg_id, &incoming.body) {
+        for reply in dispatcher.handle_message(&mut ctx, incoming.msg_id, &incoming.body) {
             let seq = session.next_content_seq();
             let enc = session.encrypt(next_message_id(), seq, &reply);
             write_frame(&mut sock, transport, &enc)?;
