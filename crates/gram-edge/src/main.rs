@@ -1,20 +1,22 @@
-//! ShuzaGram edge gateway.
+//! ShuzaGram async edge gateway (`gram-edge`).
 
-use std::net::TcpListener;
 use std::sync::Arc;
 
 use gram_core::dispatch::DcEndpoint;
-use gram_core::{Dispatcher, Store};
+use gram_core::{Dispatcher, SessionHub, Store};
+use gram_edge::async_edge::{serve_tcp_listener, serve_ws_listener, EdgeConfig};
 use gram_edge::keystore::KeyStore;
-use gram_edge::transport;
 use mtproto_crypto::dh;
+use mtproto_crypto::faketls::FakeTlsSecret;
 use mtproto_crypto::rsa_key::ServerRsaKey;
+use tokio::net::TcpListener;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let addr = std::env::var("EDGE_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
+    let ws_addr = std::env::var("EDGE_WS_ADDR").ok().filter(|s| !s.is_empty());
 
     let rsa_path = std::env::var("SHUZA_RSA_KEY").ok().filter(|s| !s.is_empty());
-    // Persistent key if SHUZA_RSA_KEY points to a file; else an ephemeral key.
     let rsa = match &rsa_path {
         Some(path) => {
             eprintln!("[edge] loading server RSA-2048 key from {path}");
@@ -27,22 +29,20 @@ fn main() {
             }
         }
         None => {
-            eprintln!("[edge] generating an ephemeral server RSA-2048 key (set SHUZA_RSA_KEY to persist)");
+            eprintln!(
+                "[edge] generating an ephemeral server RSA-2048 key (set SHUZA_RSA_KEY to persist)"
+            );
             Arc::new(ServerRsaKey::generate())
         }
     };
     let dh = dh::server_default();
 
-    // If asked, print the public key to embed in the client, then exit.
     if std::env::args().any(|a| a == "--print-pubkey") {
         println!("fingerprint (u64): {:#018x}", rsa.fingerprint as u64);
         println!("{}", rsa.public_key_pkcs1_pem());
         return;
     }
 
-    // Persist established auth keys and registered users next to the RSA key
-    // (or SHUZA_AUTHKEYS / SHUZA_USERS), so cached client keys & sessions
-    // survive server restarts.
     let data_dir = rsa_path.as_ref().map(|p| {
         std::path::Path::new(p)
             .parent()
@@ -61,17 +61,14 @@ fn main() {
     });
 
     let keys = Arc::new(KeyStore::load(keys_path));
+    let hub = Arc::new(SessionHub::new());
 
-    // Test-server master code: read from the environment only, never hardcoded.
-    // When set, any phone number registers with this code.
     let test_code = std::env::var("SHUZA_TEST_CODE").ok().filter(|s| !s.is_empty());
     let store = Arc::new(Store::with_persistence(test_code, users_path));
     if store.is_test_server() {
         eprintln!("[edge] TEST SERVER mode: any number registers with the configured test code");
     }
 
-    // Address advertised to clients in help.getConfig. Defaults match the
-    // listener; override with SHUZA_DC_IP / SHUZA_DC_PORT / SHUZA_DC_ID.
     let dc = DcEndpoint {
         dc_id: std::env::var("SHUZA_DC_ID")
             .ok()
@@ -84,9 +81,25 @@ fn main() {
             .unwrap_or(8443),
     };
     eprintln!("[edge] advertising dc{} at {}:{}", dc.dc_id, dc.ip, dc.port);
+
+    let fake_tls = std::env::var("SHUZA_FAKETLS_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|hex_sec| match FakeTlsSecret::from_hex(&hex_sec) {
+            Ok(s) => {
+                eprintln!("[edge] Fake-TLS / proxy secret enabled");
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[edge] invalid SHUZA_FAKETLS_SECRET ignored: {e}");
+                None
+            }
+        });
+
     let dispatcher = Arc::new(
         Dispatcher::new(store)
             .with_keys(Arc::clone(&keys))
+            .with_hub(Arc::clone(&hub))
             .with_dc(dc),
     );
     eprintln!(
@@ -94,7 +107,31 @@ fn main() {
         rsa.fingerprint
     );
 
-    let listener = match TcpListener::bind(&addr) {
+    let cfg = EdgeConfig {
+        rsa,
+        dh,
+        dispatcher,
+        keys,
+        fake_tls,
+        enforce_clock_window: false,
+    };
+
+    if let Some(ws_bind) = ws_addr {
+        match TcpListener::bind(&ws_bind).await {
+            Ok(ws_listener) => {
+                eprintln!("[edge] listening WebSocket MTProto on ws://{ws_bind}");
+                let ws_cfg = cfg.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_ws_listener(ws_listener, ws_cfg).await {
+                        eprintln!("[edge] ws listener error: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("[edge] cannot bind WS {ws_bind}: {e}"),
+        }
+    }
+
+    let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[edge] cannot bind {addr}: {e}");
@@ -103,25 +140,7 @@ fn main() {
     };
     eprintln!("[edge] listening on {addr}");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(sock) => {
-                let rsa = Arc::clone(&rsa);
-                let dh = dh.clone();
-                let dispatcher = Arc::clone(&dispatcher);
-                let keys = Arc::clone(&keys);
-                std::thread::spawn(move || {
-                    let peer = sock
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "?".into());
-                    match transport::serve_connection(sock, &rsa, &dh, &dispatcher, &keys) {
-                        Ok(()) => eprintln!("[edge] {peer}: session closed"),
-                        Err(e) => eprintln!("[edge] {peer}: {e}"),
-                    }
-                });
-            }
-            Err(e) => eprintln!("[edge] accept error: {e}"),
-        }
+    if let Err(e) = serve_tcp_listener(listener, cfg).await {
+        eprintln!("[edge] fatal listener error: {e}");
     }
 }

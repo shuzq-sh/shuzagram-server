@@ -9,6 +9,7 @@ description = "MTProto TL wire (de)serialization primitives"
 
 [dependencies]
 thiserror.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

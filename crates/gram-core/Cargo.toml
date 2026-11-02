@@ -9,7 +9,9 @@ description = "Authenticated MTProto session layer and auth RPCs"
 
 [dependencies]
 tl-core = { path = "../tl-core" }
+tl-compiler = { path = "../tl-compiler" }
 mtproto-crypto = { path = "../mtproto-crypto" }
 rand.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
+tokio.workspace = true

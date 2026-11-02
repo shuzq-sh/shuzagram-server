@@ -1,6 +1,7 @@
 //! ShuzaGram edge gateway library: MTProto transport framing and the
 //! unencrypted DH handshake that establishes a session `auth_key`.
 
+pub mod async_edge;
 pub mod client;
 pub mod handshake;
 pub mod keystore;

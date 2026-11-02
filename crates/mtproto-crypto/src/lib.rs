@@ -12,8 +12,10 @@
 
 pub mod dh;
 pub mod factorize;
+pub mod faketls;
 pub mod ige;
 pub mod kdf;
+pub mod replay;
 pub mod rsa_key;
 
 use sha1::Digest as _;

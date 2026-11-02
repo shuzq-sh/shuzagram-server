@@ -1,0 +1,14 @@
+[package]
+name = "tl-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "TL schema parser, CRC32 constructor verifier, and multi-layer adapter registry"
+
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tl-core = { path = "../tl-core" }

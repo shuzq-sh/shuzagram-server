@@ -3,13 +3,16 @@
 
 use std::io::Read as _;
 use std::sync::Arc;
+use std::time::Instant;
 
 use flate2::read::GzDecoder;
 use mtproto_crypto::dh;
 use mtproto_crypto::kdf::{self, Direction};
 use rand::RngCore;
+use tl_compiler::LayerAdapterRegistry;
 use tl_core::{Reader, TlError, Writer};
 
+use crate::egress::SessionHub;
 use crate::keystore::KeyStore;
 use crate::store::{Store, User};
 
@@ -100,6 +103,9 @@ const HELP_SAVE_APP_LOG: u32 = 0x6f02_f748;
 const HELP_GET_PEER_COLORS: u32 = 0xda80_f42f;
 const HELP_GET_PEER_PROFILE_COLORS: u32 = 0xabcf_a9fd;
 const HELP_PEER_COLORS_NOT_MODIFIED: u32 = 0x2ba1_f5ce;
+const HELP_GET_CDN_CONFIG: u32 = 0x5202_9342;
+const CDN_CONFIG: u32 = 0x5725_e40a;
+const ACCOUNT_REGISTER_DEVICE_TGNET: u32 = 0x637e_a878;
 
 const LANGPACK_GET_LANGUAGES: u32 = 0x42c6_978f;
 const LANGPACK_GET_LANGUAGES_LEGACY: u32 = 0x800f_d57d;
@@ -248,9 +254,14 @@ const PEER_STORIES: u32 = 0x9a35_e999;
 /// Per-connection state threaded through dispatch.
 #[derive(Default)]
 pub struct ConnContext {
+    pub conn_id: u64,
     pub auth_key_id: i64,
     pub server_salt: i64,
     pub session_id: i64,
+    pub negotiated_layer: u16,
+    pub is_push_socket: bool,
+    pub device_model: String,
+    pub app_version: String,
     pub user: Option<User>,
 }
 
@@ -310,6 +321,8 @@ impl Default for DcEndpoint {
 pub struct Dispatcher {
     store: Arc<Store>,
     keys: Arc<KeyStore>,
+    hub: Arc<SessionHub>,
+    layers: Arc<LayerAdapterRegistry>,
     dc: DcEndpoint,
 }
 
@@ -318,6 +331,8 @@ impl Dispatcher {
         Dispatcher {
             store,
             keys: Arc::new(KeyStore::load(None)),
+            hub: Arc::new(SessionHub::new()),
+            layers: Arc::new(LayerAdapterRegistry::new()),
             dc: DcEndpoint::default(),
         }
     }
@@ -329,10 +344,32 @@ impl Dispatcher {
         self
     }
 
+    /// Share a [`SessionHub`] for real-time `Updates` push & sniffer telemetry.
+    pub fn with_hub(mut self, hub: Arc<SessionHub>) -> Self {
+        self.hub = hub;
+        self
+    }
+
     /// Set the data-center endpoint advertised by `help.getConfig`.
     pub fn with_dc(mut self, dc: DcEndpoint) -> Self {
         self.dc = dc;
         self
+    }
+
+    pub fn hub(&self) -> &Arc<SessionHub> {
+        &self.hub
+    }
+
+    pub fn dc(&self) -> &DcEndpoint {
+        &self.dc
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    pub fn keys(&self) -> &Arc<KeyStore> {
+        &self.keys
     }
 
     /// Handle one decrypted inbound message body, returning reply bodies.
@@ -391,7 +428,7 @@ impl Dispatcher {
         }
 
         // Unwrap invokeWithLayer / initConnection / invokeAfterMsg* down to the inner query.
-        let query = match peel_wrappers(id, &mut r) {
+        let raw_query = match peel_wrappers_ctx(id, &mut r, ctx, 0) {
             Ok(q) => q,
             Err(e) => {
                 eprintln!("[core] wrapper decode error on {id:#010x}: {e}");
@@ -400,6 +437,15 @@ impl Dispatcher {
                     &rpc_error(400, "QUERY_MALFORMED"),
                 ))];
             }
+        };
+        let layer = if ctx.negotiated_layer > 0 {
+            ctx.negotiated_layer
+        } else {
+            232
+        };
+        let query = match self.layers.upgrade_ingress_rpc(layer, &raw_query) {
+            Ok(q) => q,
+            Err(_) => std::borrow::Cow::Borrowed(raw_query.as_slice()),
         };
 
         let mut qr = Reader::new(&query);
@@ -446,7 +492,65 @@ impl Dispatcher {
             _ => {}
         }
 
+        self.hub.bump_rpc_counter();
+        let sniffer_on = self.hub.sniffer_enabled();
+        let started = if sniffer_on {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
         let result = self.dispatch_query(ctx, qid, &mut qr);
+
+        if ctx.conn_id != 0 {
+            let perm_id = self.keys.resolve_perm(ctx.auth_key_id);
+            self.hub.update_session(
+                ctx.conn_id,
+                ctx.auth_key_id,
+                perm_id,
+                ctx.session_id,
+                ctx.user.as_ref().map(|u| u.id),
+                layer,
+                ctx.is_push_socket,
+                if ctx.device_model.is_empty() {
+                    None
+                } else {
+                    Some(ctx.device_model.as_str())
+                },
+                if ctx.app_version.is_empty() {
+                    None
+                } else {
+                    Some(ctx.app_version.as_str())
+                },
+            );
+        }
+
+        if let Some(t0) = started {
+            let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            let (err_code, err_msg) = if result.len() >= 8
+                && u32::from_le_bytes(result[0..4].try_into().unwrap()) == RPC_ERROR
+            {
+                let mut er = Reader::new(&result[4..]);
+                let c = er.read_i32().unwrap_or(400);
+                let m = er.read_string().unwrap_or("").to_string();
+                (c, m)
+            } else {
+                (0, String::new())
+            };
+            let mname = self.layers.method_name(qid).unwrap_or("unknown");
+            self.hub.record_rpc_trace(
+                self.dc.dc_id,
+                ctx.user.as_ref().map_or(0, |u| u.id),
+                ctx.auth_key_id,
+                layer,
+                qid,
+                mname,
+                dur_us,
+                err_code,
+                &err_msg,
+            );
+        }
+
         vec![Outbound::content(rpc_result(msg_id, &result))]
     }
 
@@ -498,6 +602,7 @@ impl Dispatcher {
             HELP_GET_PEER_COLORS | HELP_GET_PEER_PROFILE_COLORS => {
                 empty_ctor(HELP_PEER_COLORS_NOT_MODIFIED)
             }
+            HELP_GET_CDN_CONFIG => cdn_config_empty(),
 
             LANGPACK_GET_LANGUAGES
             | LANGPACK_GET_LANGUAGES_LEGACY
@@ -540,8 +645,11 @@ impl Dispatcher {
             USERS_GET_USERS => self.users_get_users(ctx, r),
             USERS_GET_FULL_USER => self.users_get_full_user(ctx, r),
 
+            ACCOUNT_REGISTER_DEVICE | ACCOUNT_REGISTER_DEVICE_TGNET => {
+                ctx.is_push_socket = true;
+                bool_result(true)
+            }
             ACCOUNT_UPDATE_STATUS
-            | ACCOUNT_REGISTER_DEVICE
             | ACCOUNT_UNREGISTER_DEVICE
             | ACCOUNT_UPDATE_NOTIFY_SETTINGS
             | ACCOUNT_RESET_NOTIFY_SETTINGS
@@ -1529,6 +1637,13 @@ fn stories_all_stories_not_modified() -> Vec<u8> {
     w.into_vec()
 }
 
+fn cdn_config_empty() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(CDN_CONFIG);
+    w.write_vector_header(0); // public_keys: Vector<CdnPublicKey>
+    w.into_vec()
+}
+
 /// A bare Bool result.
 fn bool_result(v: bool) -> Vec<u8> {
     let mut w = Writer::new();
@@ -1591,11 +1706,23 @@ fn skip_json_value(r: &mut Reader, depth: usize) -> Result<(), TlError> {
 /// Peel `invokeWithLayer`, `initConnection` (including `proxy` and `JSONValue`
 /// `params`), `invokeAfterMsg*`, and Play Integrity / ReCaptcha wrappers,
 /// returning the inner query bytes (including its constructor id).
-fn peel_wrappers(mut id: u32, r: &mut Reader) -> Result<Vec<u8>, TlError> {
+fn peel_wrappers_ctx(
+    mut id: u32,
+    r: &mut Reader,
+    ctx: &mut ConnContext,
+    mut depth: u8,
+) -> Result<Vec<u8>, TlError> {
     loop {
+        if depth > 16 {
+            return Err(TlError::WrapperDepthExceeded { max_depth: 16 });
+        }
+        depth += 1;
         match id {
             INVOKE_WITH_LAYER => {
-                let _layer = r.read_i32()?;
+                let layer = r.read_i32()?;
+                if (1..=1000).contains(&layer) {
+                    ctx.negotiated_layer = layer as u16;
+                }
             }
             INVOKE_AFTER_MSG => {
                 let _after = r.read_i64()?;
@@ -1628,13 +1755,22 @@ fn peel_wrappers(mut id: u32, r: &mut Reader) -> Result<Vec<u8>, TlError> {
                 let unpacked = gunzip_bounded(packed).map_err(|_| TlError::InvalidPadding)?;
                 let mut ur = Reader::new(&unpacked);
                 let inner_id = ur.read_u32()?;
-                return peel_wrappers(inner_id, &mut ur);
+                return peel_wrappers_ctx(inner_id, &mut ur, ctx, depth);
             }
             INIT_CONNECTION => {
                 let flags = r.read_i32()?;
                 let _api_id = r.read_i32()?;
-                for _ in 0..6 {
-                    let _ = r.read_string()?; // device_model..lang_code
+                let device_model = r.read_string()?;
+                let _system_version = r.read_string()?;
+                let app_version = r.read_string()?;
+                let _system_lang_code = r.read_string()?;
+                let _lang_pack = r.read_string()?;
+                let _lang_code = r.read_string()?;
+                if !device_model.is_empty() {
+                    ctx.device_model = device_model.to_string();
+                }
+                if !app_version.is_empty() {
+                    ctx.app_version = app_version.to_string();
                 }
                 if flags & 1 != 0 {
                     let proxy_id = r.read_u32()?;
@@ -2360,6 +2496,7 @@ mod tests {
             auth_key_id: 0x1111,
             session_id: 0x2222,
             server_salt: 0x3333,
+            ..Default::default()
         };
 
         // 1. users.getUsers with [inputUserSelf, inputUser(bob)] -> self flag set ONLY on alice!

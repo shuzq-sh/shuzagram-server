@@ -13,9 +13,11 @@
 
 mod reader;
 mod writer;
+pub mod zerocopy_tl;
 
 pub use reader::Reader;
 pub use writer::Writer;
+pub use zerocopy_tl::{TlBytes, TlRead, TlSliceIter, TlStr, TlWrite};
 
 /// `Vector<t>` boxed constructor id.
 pub const VECTOR_ID: u32 = 0x1cb5_c415;
@@ -37,6 +39,8 @@ pub enum TlError {
     InvalidPadding,
     #[error("vector length {count} overflows a reasonable bound")]
     VectorLengthOverflow { count: u32 },
+    #[error("invoke wrapper nesting depth exceeded maximum {max_depth}")]
+    WrapperDepthExceeded { max_depth: u8 },
 }
 
 /// A TL object with a boxed constructor id, able to round-trip through the wire.

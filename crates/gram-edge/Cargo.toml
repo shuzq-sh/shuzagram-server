@@ -18,6 +18,11 @@ rand.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 crc32fast.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 
 [[bin]]
 name = "gram-edge"
