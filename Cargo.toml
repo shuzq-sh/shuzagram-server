@@ -4,6 +4,7 @@ members = [
     "crates/mtproto-crypto",
     "crates/tl-core",
     "crates/tl-compiler",
+    "crates/gram-store",
     "crates/gram-edge",
     "crates/gram-core",
 ]
@@ -35,6 +36,7 @@ bytes = "1.7"
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

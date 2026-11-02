@@ -116,15 +116,19 @@ const LANGPACK_GET_DIFFERENCE: u32 = 0xcd98_4aa5;
 const LANGPACK_DIFFERENCE: u32 = 0xf385_c1f6;
 
 const UPDATES_GET_STATE: u32 = 0xedd4_882a;
+#[cfg(test)]
 const UPDATES_STATE: u32 = 0xa56c_2a3e;
 const UPDATES_GET_DIFFERENCE: u32 = 0x19c2_f763;
 const UPDATES_GET_DIFFERENCE_LEGACY: u32 = 0x2593_9651;
+#[allow(dead_code)]
 const UPDATES_DIFFERENCE_EMPTY: u32 = 0x5d75_a138;
 
 const MESSAGES_GET_DIALOGS: u32 = 0xa0f4_cb4f;
+#[cfg(test)]
 const MESSAGES_DIALOGS: u32 = 0x15ba_6c40;
 const MESSAGES_GET_PINNED_DIALOGS: u32 = 0xd6b9_4df2;
 const MESSAGES_GET_PEER_DIALOGS: u32 = 0xe470_bcfd;
+#[allow(dead_code)]
 const MESSAGES_PEER_DIALOGS: u32 = 0x3371_c354;
 const MESSAGES_GET_DIALOG_FILTERS: u32 = 0xefd4_8c89;
 const MESSAGES_GET_DIALOG_FILTERS_LEGACY: u32 = 0xf19e_d96d;
@@ -233,6 +237,7 @@ const ACCOUNT_GET_AUTHORIZATIONS: u32 = 0xe320_c158;
 const ACCOUNT_AUTHORIZATIONS: u32 = 0x4bff_8ea0;
 
 const CONTACTS_GET_CONTACTS: u32 = 0x5dd6_9e12;
+#[allow(dead_code)]
 const CONTACTS_CONTACTS_NOT_MODIFIED: u32 = 0xb74b_a9d2;
 const CONTACTS_GET_STATUSES: u32 = 0xc4a3_53ee;
 const CONTACTS_GET_TOP_PEERS: u32 = 0x9734_78b6;
@@ -611,11 +616,52 @@ impl Dispatcher {
             LANGPACK_GET_LANG_PACK => langpack_get_lang_pack(r),
             LANGPACK_GET_DIFFERENCE => langpack_get_difference(r),
 
-            UPDATES_GET_STATE => updates_state(),
-            UPDATES_GET_DIFFERENCE | UPDATES_GET_DIFFERENCE_LEGACY => updates_difference_empty(),
+            UPDATES_GET_STATE => self.updates_get_state_real(ctx),
+            UPDATES_GET_DIFFERENCE => self.updates_get_difference_real(ctx, r, false),
+            UPDATES_GET_DIFFERENCE_LEGACY => self.updates_get_difference_real(ctx, r, true),
 
-            MESSAGES_GET_DIALOGS => messages_dialogs_empty(),
-            MESSAGES_GET_PINNED_DIALOGS | MESSAGES_GET_PEER_DIALOGS => messages_peer_dialogs(ctx),
+            MESSAGES_GET_DIALOGS => self.messages_get_dialogs_real(ctx, r),
+            MESSAGES_GET_PINNED_DIALOGS => self.messages_get_peer_dialogs_real(ctx, r, true),
+            MESSAGES_GET_PEER_DIALOGS => self.messages_get_peer_dialogs_real(ctx, r, false),
+            0x4423_e6c5 => self.messages_get_history(ctx, r), // messages.getHistory
+            0x4222_fa74 => self.messages_get_messages(ctx, r, false), // messages.getMessages
+            0x63c6_6523 => self.messages_get_messages(ctx, r, true),  // messages.getMessages (vector<InputMessage>)
+            0xfef4_8f62 => self.messages_send_message(ctx, r, false), // messages.sendMessage Layer 232
+            0x983f_9745 | 0x280d_096f => self.messages_send_message(ctx, r, true), // messages.sendMessage legacy int reply
+            0xb106_e66c | 0xdfd1_4005 => self.messages_edit_message(ctx, r), // messages.editMessage
+            0xe58e_95d2 => self.messages_delete_messages(ctx, r), // messages.deleteMessages
+            0xb08f_922a => self.messages_delete_history(ctx, r),  // messages.deleteHistory
+            0x0e30_6d3a => self.messages_read_history(ctx, r),    // messages.readHistory
+            0x5894_3ee2 => self.messages_set_typing(ctx, r),      // messages.setTyping
+            0x0034_a818 => self.messages_create_chat(ctx, r, true), // messages.createChat Layer 232
+            0x92ce_ddd4 => self.messages_create_chat(ctx, r, false), // messages.createChat legacy
+            0x9100_6707 => self.channels_create_channel(ctx, r),   // channels.createChannel
+            0x0a7f_6bbb => self.channels_get_channels(ctx, r),     // channels.getChannels
+            0x0873_6a09 => self.channels_get_full_channel(ctx, r), // channels.getFullChannel
+            0x24b5_24c5 => self.channels_join_channel(ctx, r),     // channels.joinChannel
+            0xf836_aa95 => self.channels_leave_channel(ctx, r),    // channels.leaveChannel
+            0x10e6_bd2c => self.channels_check_username(ctx, r),   // channels.checkUsername
+            0x3514_b3de => self.channels_update_username(ctx, r),  // channels.updateUsername
+            0xcc10_4937 => self.channels_read_history(ctx, r),     // channels.readHistory
+            0x93d7_b347 => self.channels_get_messages(ctx, r, false), // channels.getMessages
+            0x0317_3d78 => self.updates_get_channel_difference(ctx, r), // updates.getChannelDifference
+
+            0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
+            0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername
+            0x3e0b_dd7c => self.account_update_username(ctx, r),  // account.updateUsername
+
+            CONTACTS_GET_CONTACTS => self.contacts_get_contacts(ctx, r),
+            0x2c80_0be5 => self.contacts_import_contacts(ctx, r), // contacts.importContacts
+            0xd9ba_2e54 => self.contacts_add_contact(ctx, r, true), // contacts.addContact Layer 232
+            0xe8f4_e44f => self.contacts_add_contact(ctx, r, false), // contacts.addContact legacy
+            0x096a_0e00 => self.contacts_delete_contacts(ctx, r), // contacts.deleteContacts
+            0x725a_fbbc => self.contacts_resolve_username(ctx, r, true), // contacts.resolveUsername Layer 232
+            0xf93b_bf40 => self.contacts_resolve_username(ctx, r, false), // contacts.resolveUsername legacy
+            0x8af9_4344 => self.contacts_resolve_phone(ctx, r),    // contacts.resolvePhone
+            0x05f5_8d0f => self.contacts_search(ctx, r, true),     // contacts.search Layer 232
+            0x11f8_12d8 => self.contacts_search(ctx, r, false),    // contacts.search legacy
+            CONTACTS_GET_STATUSES => self.contacts_get_statuses(ctx),
+            0x9a86_8f80 => Self::contacts_get_blocked(),
             MESSAGES_GET_DIALOG_FILTERS | MESSAGES_GET_DIALOG_FILTERS_LEGACY => {
                 messages_dialog_filters_empty()
             }
@@ -664,8 +710,6 @@ impl Dispatcher {
             ACCOUNT_GET_CONTENT_SETTINGS => account_content_settings_default(),
             ACCOUNT_GET_AUTHORIZATIONS => account_authorizations_empty(),
 
-            CONTACTS_GET_CONTACTS => empty_ctor(CONTACTS_CONTACTS_NOT_MODIFIED),
-            CONTACTS_GET_STATUSES => empty_vector(),
             CONTACTS_GET_TOP_PEERS => empty_ctor(CONTACTS_TOP_PEERS_NOT_MODIFIED),
 
             PAYMENTS_GET_SAVED_STAR_GIFTS => payments_saved_star_gifts_empty(),
@@ -924,6 +968,14 @@ impl Dispatcher {
         }
     }
 
+    pub fn resolve_input_user_pub(
+        &self,
+        ctx: &ConnContext,
+        r: &mut Reader,
+    ) -> Result<Option<User>, TlError> {
+        self.resolve_input_user(ctx, r)
+    }
+
     fn resolve_input_user(&self, ctx: &ConnContext, r: &mut Reader) -> Result<Option<User>, TlError> {
         let ctor = r.read_u32()?;
         match ctor {
@@ -1167,53 +1219,6 @@ fn encode_langpack_difference(lang_code: &str, from_version: i32, version: i32) 
     w.write_i32(from_version);
     w.write_i32(version);
     w.write_vector_header(0); // strings
-    w.into_vec()
-}
-
-/// `updates.state` with an empty/initial state.
-fn updates_state() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(UPDATES_STATE);
-    w.write_i32(0); // pts
-    w.write_i32(0); // qts
-    w.write_i32(now_unix()); // date
-    w.write_i32(0); // seq
-    w.write_i32(0); // unread_count
-    w.into_vec()
-}
-
-fn updates_difference_empty() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(UPDATES_DIFFERENCE_EMPTY);
-    w.write_i32(now_unix()); // date
-    w.write_i32(0); // seq
-    w.into_vec()
-}
-
-/// `messages.dialogs` with four empty vectors (no chats yet).
-fn messages_dialogs_empty() -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(MESSAGES_DIALOGS);
-    for _ in 0..4 {
-        w.write_vector_header(0); // dialogs, messages, chats, users
-    }
-    w.into_vec()
-}
-
-/// `messages.peerDialogs#3371c354` with empty dialogs and `updates.state`.
-fn messages_peer_dialogs(ctx: &ConnContext) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_u32(MESSAGES_PEER_DIALOGS);
-    w.write_vector_header(0); // dialogs
-    w.write_vector_header(0); // messages
-    w.write_vector_header(0); // chats
-    if let Some(user) = &ctx.user {
-        w.write_vector_header(1);
-        w.write_raw(&encode_user(user));
-    } else {
-        w.write_vector_header(0);
-    }
-    w.write_raw(&updates_state());
     w.into_vec()
 }
 
@@ -2038,9 +2043,15 @@ mod decode_helpers {
         };
         User {
             id,
+            home_dc_id: 2,
             phone,
+            username: None,
             first_name,
             last_name,
+            bio: String::new(),
+            flags_bitmask: 0,
+            photo_id: None,
+            photo_dc_id: None,
             access_hash,
         }
     }

@@ -1,25 +1,48 @@
-//! User, pending login-code, and `auth_key_id -> user_id` binding store.
-//!
-//! Supports optional file-backed persistence (`users.tsv`) so registered
-//! accounts and authenticated key bindings survive server restarts and work
-//! across parallel MTProto connections (`Generic`, `Push`, `Download`, `Upload`).
+//! User, pending login-code, and `auth_key_id -> user_id` binding store,
+//! backed by [`gram_store::AcidStore`] (SQLite WAL ACID engine) with seamless
+//! legacy `users.tsv` auto-migration and append compatibility.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use gram_store::{AcidStore, UserRow};
 use rand::RngCore;
 
-/// A registered user (minimal fields needed for login and profile).
-#[derive(Debug, Clone)]
+/// A registered ShuzaGram user hydrated from [`AcidStore`].
+#[derive(Debug, Clone, Default)]
 pub struct User {
     pub id: i64,
+    pub home_dc_id: i32,
     pub phone: String,
+    pub username: Option<String>,
     pub first_name: String,
     pub last_name: String,
+    pub bio: String,
+    pub flags_bitmask: i64,
+    pub photo_id: Option<i64>,
+    pub photo_dc_id: Option<i32>,
     pub access_hash: i64,
+}
+
+impl From<UserRow> for User {
+    fn from(r: UserRow) -> Self {
+        Self {
+            id: r.user_id,
+            home_dc_id: r.home_dc_id,
+            phone: r.phone,
+            username: r.username,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            bio: r.bio,
+            flags_bitmask: r.flags_bitmask,
+            photo_id: r.photo_id,
+            photo_dc_id: r.photo_dc_id,
+            access_hash: r.access_hash,
+        }
+    }
 }
 
 /// A pending login code awaiting confirmation.
@@ -30,19 +53,21 @@ struct PendingCode {
     verified: bool,
 }
 
-/// Thread-safe user and session-binding store.
-#[derive(Default)]
+/// Thread-safe user, session-binding, and ACID messaging store.
 pub struct Store {
-    path: Option<String>,
-    users_by_phone: Mutex<HashMap<String, User>>,
-    users_by_id: Mutex<HashMap<i64, User>>,
-    key_users: Mutex<HashMap<i64, i64>>, // auth_key_id -> user_id
+    tsv_path: Option<String>,
+    acid: Arc<AcidStore>,
     pending: Mutex<HashMap<String, PendingCode>>, // phone_code_hash -> PendingCode
-    next_user_id: AtomicI64,
     /// Test-server override: when set, any pending login accepts this code, so
     /// any phone number can register. Supplied at runtime (never stored in the
     /// repo or persisted to disk); `None` means normal per-number codes only.
     test_code: Option<String>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Store {
@@ -50,73 +75,86 @@ impl Store {
         Self::with_test_code(None)
     }
 
-    /// Build a store, optionally enabling the test-server master code.
+    /// Build an in-memory ACID store, optionally enabling the test-server master code.
     pub fn with_test_code(test_code: Option<String>) -> Self {
-        Self::with_persistence(test_code, None)
+        let acid = Arc::new(
+            AcidStore::open_in_memory(2).expect("failed to initialize in-memory AcidStore"),
+        );
+        Self::with_acid(test_code, acid)
     }
 
-    /// Build a store with optional TSV persistence for users and key bindings.
-    pub fn with_persistence(test_code: Option<String>, path: Option<String>) -> Self {
-        let mut users_by_phone = HashMap::new();
-        let mut users_by_id = HashMap::new();
-        let mut key_users = HashMap::new();
-        let mut max_id = 999i64;
-
-        if let Some(p) = &path {
-            if let Ok(text) = std::fs::read_to_string(p) {
-                for line in text.lines() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    match parts.first().copied() {
-                        Some("U") if parts.len() >= 6 => {
-                            if let (Ok(id), Ok(access_hash)) =
-                                (parts[1].parse::<i64>(), parts[5].parse::<i64>())
-                            {
-                                let user = User {
-                                    id,
-                                    phone: parts[2].to_string(),
-                                    first_name: parts[3].to_string(),
-                                    last_name: parts[4].to_string(),
-                                    access_hash,
-                                };
-                                if id > max_id {
-                                    max_id = id;
-                                }
-                                users_by_phone.insert(user.phone.clone(), user.clone());
-                                users_by_id.insert(id, user);
-                            }
-                        }
-                        Some("K") if parts.len() >= 3 => {
-                            if let (Ok(kid), Ok(uid)) =
-                                (parts[1].parse::<i64>(), parts[2].parse::<i64>())
-                            {
-                                key_users.insert(kid, uid);
-                            }
-                        }
-                        Some("X") if parts.len() >= 2 => {
-                            if let Ok(kid) = parts[1].parse::<i64>() {
-                                key_users.remove(&kid);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                eprintln!(
-                    "[core] loaded {} user(s) and {} key binding(s) from {p}",
-                    users_by_id.len(),
-                    key_users.len()
-                );
-            }
-        }
-
+    /// Build a store sharing an explicit [`AcidStore`] (used in Multi-DC federation tests
+    /// and shared edge + admin deployments).
+    pub fn with_acid(test_code: Option<String>, acid: Arc<AcidStore>) -> Self {
         Store {
-            path,
-            users_by_phone: Mutex::new(users_by_phone),
-            users_by_id: Mutex::new(users_by_id),
-            key_users: Mutex::new(key_users),
+            tsv_path: None,
+            acid,
             pending: Mutex::new(HashMap::new()),
-            next_user_id: AtomicI64::new(max_id + 1),
             test_code,
         }
+    }
+
+    /// Build a store with persistent SQLite WAL storage (`shuzagram.db`) and
+    /// automatic idempotent import of any existing `users.tsv`.
+    pub fn with_persistence(test_code: Option<String>, path: Option<String>) -> Self {
+        let default_dc: i32 = std::env::var("SHUZA_DC_ID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
+        let acid = match &path {
+            Some(tsv_str) => {
+                let db_path = std::env::var("SHUZA_DB")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let p = Path::new(tsv_str);
+                        match p.parent() {
+                            Some(dir) if !dir.as_os_str().is_empty() => {
+                                dir.join("shuzagram.db").to_string_lossy().into_owned()
+                            }
+                            _ => "shuzagram.db".to_string(),
+                        }
+                    });
+                let engine = AcidStore::open_path(&db_path, default_dc)
+                    .unwrap_or_else(|e| panic!("failed to open AcidStore at {db_path}: {e}"));
+                match engine.import_legacy_tsv(tsv_str) {
+                    Ok(n) if n > 0 => {
+                        eprintln!(
+                            "[core] migrated/synced {n} legacy record(s) from {tsv_str} into {db_path} (total users={})",
+                            engine.user_count()
+                        );
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "[core] opened AcidStore at {db_path} (total users={})",
+                            engine.user_count()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[core] warning: legacy TSV import error from {tsv_str}: {e}");
+                    }
+                }
+                Arc::new(engine)
+            }
+            None => Arc::new(
+                AcidStore::open_in_memory(default_dc)
+                    .expect("failed to initialize in-memory AcidStore"),
+            ),
+        };
+
+        Store {
+            tsv_path: path,
+            acid,
+            pending: Mutex::new(HashMap::new()),
+            test_code,
+        }
+    }
+
+    /// Access the underlying [`AcidStore`] for messaging, contacts, channels,
+    /// media blobs, Stars economy, and admin operations.
+    pub fn acid(&self) -> &Arc<AcidStore> {
+        &self.acid
     }
 
     /// Whether the test-server master code is enabled.
@@ -165,8 +203,8 @@ impl Store {
         let phone = {
             let mut p = self.pending.lock().unwrap();
             let entry = p.get_mut(phone_code_hash)?;
-            let ok = entry.code == code
-                || self.test_code.as_deref().is_some_and(|m| m == code);
+            let ok =
+                entry.code == code || self.test_code.as_deref().is_some_and(|m| m == code);
             if !ok {
                 return None;
             }
@@ -191,9 +229,11 @@ impl Store {
         let allowed = {
             let mut p = self.pending.lock().unwrap();
             if let Some(entry) = p.remove(phone_code_hash) {
-                normalize_phone(&entry.phone) == normalized || entry.verified || self.is_test_server()
+                normalize_phone(&entry.phone) == normalized
+                    || entry.verified
+                    || self.is_test_server()
             } else {
-                self.is_test_server() || self.users_by_phone.lock().unwrap().contains_key(&normalized)
+                self.is_test_server() || self.acid.user_by_phone(&normalized).is_some()
             }
         };
         if !allowed {
@@ -207,54 +247,26 @@ impl Store {
         Some(self.get_or_create_user(&normalized, Some(fname), Some(last_name.trim())))
     }
 
-    fn get_or_create_user(
+    pub fn get_or_create_user(
         &self,
         phone: &str,
         first_name: Option<&str>,
         last_name: Option<&str>,
     ) -> User {
         let normalized = normalize_phone(phone);
-        let mut by_phone = self.users_by_phone.lock().unwrap();
-        let mut by_id = self.users_by_id.lock().unwrap();
-
-        if let Some(existing) = by_phone.get_mut(&normalized) {
-            let mut changed = false;
-            if let Some(f) = first_name {
-                if !f.is_empty() && existing.first_name != f {
-                    existing.first_name = sanitize_tsv(f);
-                    changed = true;
-                }
-            }
-            if let Some(l) = last_name {
-                if existing.last_name != l {
-                    existing.last_name = sanitize_tsv(l);
-                    changed = true;
-                }
-            }
-            let u = existing.clone();
-            by_id.insert(u.id, u.clone());
-            drop(by_id);
-            drop(by_phone);
-            if changed {
-                self.append_user_record(&u);
-            }
-            return u;
-        }
-
-        let id = self.next_user_id.fetch_add(1, Ordering::SeqCst);
-        let user = User {
-            id,
-            phone: sanitize_tsv(&normalized),
-            first_name: sanitize_tsv(first_name.unwrap_or("ShuzaGram")),
-            last_name: sanitize_tsv(last_name.unwrap_or("User")),
-            access_hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
-        };
-        by_phone.insert(normalized, user.clone());
-        by_id.insert(id, user.clone());
-        drop(by_id);
-        drop(by_phone);
-        self.append_user_record(&user);
-        user
+        let clean_first = first_name.map(sanitize_tsv);
+        let clean_last = last_name.map(sanitize_tsv);
+        let row = self
+            .acid
+            .get_or_create_user(
+                &normalized,
+                clean_first.as_deref(),
+                clean_last.as_deref(),
+            )
+            .expect("AcidStore::get_or_create_user failed");
+        let u = User::from(row);
+        self.append_user_record(&u);
+        u
     }
 
     /// Bind an `auth_key_id` (permanent or temporary) to a logged-in `user_id`.
@@ -262,14 +274,21 @@ impl Store {
         if auth_key_id == 0 {
             return;
         }
-        {
-            let mut ku = self.key_users.lock().unwrap();
-            if ku.get(&auth_key_id) == Some(&user_id) {
-                return;
-            }
-            ku.insert(auth_key_id, user_id);
-        }
+        let home_dc = self
+            .acid
+            .user_by_id(user_id)
+            .map(|u| u.home_dc_id)
+            .unwrap_or(2);
+        let _ = self.acid.bind_key_user(auth_key_id, user_id, home_dc, 1);
         self.append_line(&format!("K\t{auth_key_id}\t{user_id}\n"));
+    }
+
+    /// Bind a federated proxy/guest `auth_key_id` (`binding_mode = 2`) to `user_id`.
+    pub fn bind_proxy_key_user(&self, auth_key_id: i64, user_id: i64, home_dc_id: i32) {
+        if auth_key_id == 0 {
+            return;
+        }
+        let _ = self.acid.bind_key_user(auth_key_id, user_id, home_dc_id, 2);
     }
 
     /// Unbind an `auth_key_id` on `auth.logOut`.
@@ -277,35 +296,42 @@ impl Store {
         if auth_key_id == 0 {
             return;
         }
-        if self.key_users.lock().unwrap().remove(&auth_key_id).is_some() {
-            self.append_line(&format!("X\t{auth_key_id}\n"));
-        }
+        let _ = self.acid.unbind_key(auth_key_id);
+        self.append_line(&format!("X\t{auth_key_id}\n"));
     }
 
     /// Look up the logged-in user bound to `auth_key_id`, if any.
     pub fn user_for_key(&self, auth_key_id: i64) -> Option<User> {
-        let uid = *self.key_users.lock().unwrap().get(&auth_key_id)?;
-        self.users_by_id.lock().unwrap().get(&uid).cloned()
+        let (row, _hdc, _mode) = self.acid.key_binding(auth_key_id)?;
+        Some(User::from(row))
     }
 
     pub fn user_by_phone(&self, phone: &str) -> Option<User> {
         let normalized = normalize_phone(phone);
-        self.users_by_phone.lock().unwrap().get(&normalized).cloned()
+        self.acid.user_by_phone(&normalized).map(User::from)
     }
 
     pub fn user_by_id(&self, id: i64) -> Option<User> {
-        self.users_by_id.lock().unwrap().get(&id).cloned()
+        self.acid.user_by_id(id).map(User::from)
+    }
+
+    pub fn user_by_username(&self, username: &str) -> Option<User> {
+        self.acid.user_by_username(username).map(User::from)
     }
 
     fn append_user_record(&self, u: &User) {
         self.append_line(&format!(
             "U\t{}\t{}\t{}\t{}\t{}\n",
-            u.id, u.phone, u.first_name, u.last_name, u.access_hash
+            u.id,
+            sanitize_tsv(&u.phone),
+            sanitize_tsv(&u.first_name),
+            sanitize_tsv(&u.last_name),
+            u.access_hash
         ));
     }
 
     fn append_line(&self, line: &str) {
-        if let Some(p) = &self.path {
+        if let Some(p) = &self.tsv_path {
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
                 let _ = f.write_all(line.as_bytes());
             }
@@ -313,7 +339,7 @@ impl Store {
     }
 }
 
-fn normalize_phone(phone: &str) -> String {
+pub fn normalize_phone(phone: &str) -> String {
     let trimmed = phone.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -354,13 +380,10 @@ mod tests {
         assert_eq!(code, "22222", "test number has a fixed code");
 
         assert!(store.check_code(&hash, "00000").is_none(), "wrong code");
-        // The pending entry is consumed only on success, so retry still works
-        // after a wrong attempt.
         let user = store.check_code(&hash, &code).expect("correct code");
         assert_eq!(user.phone, "+99900099999");
         assert!(user.id >= 1000);
 
-        // Same phone logs in again -> same user id.
         let (h2, c2) = store.start_login("+99900099999");
         let user2 = store.check_code(&h2, &c2).unwrap();
         assert_eq!(user.id, user2.id);
@@ -371,13 +394,16 @@ mod tests {
         let store = Store::with_test_code(Some("00000MASTER".to_string()));
         assert!(store.is_test_server());
 
-        // An arbitrary number, with the master code, registers.
         let (hash, _code) = store.start_login("+15551234567");
-        assert!(store.check_code(&hash, "99999").is_none(), "wrong code still fails");
-        let user = store.check_code(&hash, "00000MASTER").expect("master code works");
+        assert!(
+            store.check_code(&hash, "99999").is_none(),
+            "wrong code still fails"
+        );
+        let user = store
+            .check_code(&hash, "00000MASTER")
+            .expect("master code works");
         assert_eq!(user.phone, "+15551234567");
 
-        // Without a test code, only the per-number code works.
         let plain = Store::new();
         assert!(!plain.is_test_server());
         let (h, c) = plain.start_login("+15550000000");

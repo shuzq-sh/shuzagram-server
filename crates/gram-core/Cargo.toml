@@ -11,6 +11,7 @@ description = "Authenticated MTProto session layer and auth RPCs"
 tl-core = { path = "../tl-core" }
 tl-compiler = { path = "../tl-compiler" }
 mtproto-crypto = { path = "../mtproto-crypto" }
+gram-store = { path = "../gram-store" }
 rand.workspace = true
 thiserror.workspace = true
 flate2.workspace = true

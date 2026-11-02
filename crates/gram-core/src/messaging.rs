@@ -1,0 +1,2387 @@
+//! Stateful Layer-232 messaging, dialogs, contacts, profile, basic groups,
+//! channels/supergroups, and `pts` / `updates.getDifference` engine.
+//!
+//! Every constructor ID and field layout in this module is verified directly
+//! against ShuzaGramMod (`TLRPC.java` & `tl/TL_*.java`, Layer 232).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use gram_store::{
+    ChannelRow, ChatRow, DialogRow, MessageRow, StoreError, PEER_CHANNEL as KIND_CHANNEL,
+    PEER_CHAT as KIND_CHAT, PEER_USER as KIND_USER, PTS_KIND_DELETE_MESSAGES,
+    PTS_KIND_EDIT_MESSAGE, PTS_KIND_NEW_MESSAGE, PTS_KIND_READ_INBOX, PTS_KIND_READ_OUTBOX,
+    USER_FLAG_BOT, USER_FLAG_FAKE, USER_FLAG_PREMIUM, USER_FLAG_SCAM, USER_FLAG_VERIFIED,
+};
+use tl_core::{Reader, TlError, Writer};
+
+use crate::dispatch::{rpc_error, ConnContext, Dispatcher};
+use crate::store::{normalize_phone, User};
+
+// --- Layer-232 Constructors (verified against ShuzaGramMod TLRPC.java) ------
+pub const TL_USER: u32 = 0xb1b8_cc83;
+pub const TL_USER_STATUS_ONLINE: u32 = 0xedb9_3949;
+pub const TL_USER_STATUS_OFFLINE: u32 = 0x008c_703f;
+
+pub const TL_PEER_USER: u32 = 0x5951_1722;
+pub const TL_PEER_CHAT: u32 = 0x36c6_019a;
+pub const TL_PEER_CHANNEL: u32 = 0xa2a5_371e;
+
+pub const TL_INPUT_PEER_EMPTY: u32 = 0x7f3b_18ea;
+pub const TL_INPUT_PEER_SELF: u32 = 0x7da0_7ec9;
+pub const TL_INPUT_PEER_CHAT: u32 = 0x35a9_5cb9;
+pub const TL_INPUT_PEER_CHAT_L131: u32 = 0x179b_e863;
+pub const TL_INPUT_PEER_USER: u32 = 0xdde8_a54c;
+pub const TL_INPUT_PEER_USER_L131: u32 = 0x7b8e_7de6;
+pub const TL_INPUT_PEER_CHANNEL: u32 = 0x27bc_bbfc;
+pub const TL_INPUT_PEER_CHANNEL_L131: u32 = 0x20ad_aef8;
+pub const TL_INPUT_PEER_USER_FROM_MSG: u32 = 0xa87b_0a1c;
+pub const TL_INPUT_PEER_CHANNEL_FROM_MSG: u32 = 0xbd2a_0840;
+
+pub const TL_INPUT_CHANNEL: u32 = 0xf35a_ec28;
+pub const TL_INPUT_CHANNEL_L131: u32 = 0xafeb_712e;
+pub const TL_INPUT_CHANNEL_EMPTY: u32 = 0xee8c_1e86;
+pub const TL_INPUT_CHANNEL_FROM_MSG: u32 = 0x5b93_4f9d;
+
+pub const TL_MESSAGE: u32 = 0x7600_b9d3;
+pub const TL_MESSAGE_REPLY_HEADER: u32 = 0x1b97_dd66;
+pub const TL_DIALOG: u32 = 0xfc89_f7f3;
+pub const TL_PEER_NOTIFY_SETTINGS: u32 = 0x9962_2c0c;
+
+pub const TL_MESSAGES_DIALOGS: u32 = 0x15ba_6c40;
+pub const TL_MESSAGES_PEER_DIALOGS: u32 = 0x3371_c354;
+pub const TL_MESSAGES_MESSAGES: u32 = 0x1d73_e7ea;
+pub const TL_MESSAGES_CHANNEL_MESSAGES: u32 = 0xc776_ba4e;
+pub const TL_MESSAGES_AFFECTED_MESSAGES: u32 = 0x84d1_9185;
+pub const TL_MESSAGES_AFFECTED_HISTORY: u32 = 0xb45c_69d1;
+pub const TL_MESSAGES_INVITED_USERS: u32 = 0x7f5d_efa6;
+pub const TL_MESSAGES_CHATS: u32 = 0x64ff_9fd5;
+pub const TL_MESSAGES_CHAT_FULL: u32 = 0xe5d7_d19c;
+
+pub const TL_CHAT: u32 = 0x41cb_f256;
+pub const TL_CHAT_PHOTO_EMPTY: u32 = 0x37c1_011c;
+pub const TL_PHOTO_EMPTY: u32 = 0x2331_b22d;
+pub const TL_CHANNEL: u32 = 0xd49f_34c6;
+pub const TL_CHANNEL_FULL: u32 = 0xa04e_8d3a;
+pub const TL_CHAT_INVITE_JOIN_RESULT_OK: u32 = 0x4456_63a7;
+
+pub const TL_UPDATES_STATE: u32 = 0xa56c_2a3e;
+pub const TL_UPDATES_DIFFERENCE_EMPTY: u32 = 0x5d75_a138;
+pub const TL_UPDATES_DIFFERENCE: u32 = 0x00f4_9ca0;
+pub const TL_UPDATES_CHANNEL_DIFFERENCE: u32 = 0x2064_674e;
+pub const TL_UPDATES_CHANNEL_DIFFERENCE_EMPTY: u32 = 0x3e11_affb;
+
+pub const TL_UPDATES: u32 = 0x74ae_4240;
+pub const TL_UPDATE_SHORT_SENT_MESSAGE: u32 = 0x9015_e101;
+pub const TL_UPDATE_NEW_MESSAGE: u32 = 0x1f2b_0afd;
+pub const TL_UPDATE_EDIT_MESSAGE: u32 = 0xe403_70a3;
+pub const TL_UPDATE_DELETE_MESSAGES: u32 = 0xa20d_b0e5;
+pub const TL_UPDATE_READ_HISTORY_INBOX: u32 = 0x9e84_bc99;
+pub const TL_UPDATE_READ_HISTORY_OUTBOX: u32 = 0x2f2f_21bf;
+pub const TL_UPDATE_USER_TYPING: u32 = 0x2a17_bf5c;
+pub const TL_UPDATE_NEW_CHANNEL_MESSAGE: u32 = 0x62ba_04d9;
+
+pub const TL_CONTACTS_CONTACTS: u32 = 0xeae8_7e42;
+pub const TL_CONTACT: u32 = 0x145a_de0b;
+pub const TL_CONTACT_STATUS: u32 = 0x16d9_703b;
+pub const TL_CONTACTS_IMPORTED_CONTACTS: u32 = 0x77d0_1c3b;
+pub const TL_IMPORTED_CONTACT: u32 = 0xc13e_3c50;
+pub const TL_INPUT_PHONE_CONTACT: u32 = 0x6a1d_c4be;
+pub const TL_INPUT_PHONE_CONTACT_LEGACY: u32 = 0xf392_b7f4;
+pub const TL_CONTACTS_RESOLVED_PEER: u32 = 0x7f07_7ad9;
+pub const TL_CONTACTS_FOUND: u32 = 0xb313_4d9d;
+pub const TL_CONTACTS_BLOCKED: u32 = 0x0ade_1591;
+
+pub const TL_INPUT_REPLY_TO_MESSAGE: u32 = 0x3bd4_b7c2;
+pub const TL_INPUT_REPLY_TO_MESSAGE_LEGACY: u32 = 0x22c0_f6d5;
+pub const TL_INPUT_REPLY_TO_STORY: u32 = 0x5881_323a;
+pub const TL_INPUT_REPLY_TO_STORY_L173: u32 = 0x15b0_f283;
+pub const TL_INPUT_REPLY_TO_EPHEMERAL: u32 = 0x4119_b95e;
+pub const TL_INPUT_REPLY_TO_MONOFORUM: u32 = 0x69d6_6c45;
+
+pub const TL_CHANNEL_MESSAGES_FILTER_EMPTY: u32 = 0x94d4_2ee7;
+pub const TL_CHANNEL_MESSAGES_FILTER: u32 = 0xcd77_d957;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedPeer {
+    User(i64),
+    Chat(i64),
+    Channel(i64),
+}
+
+impl ParsedPeer {
+    pub fn kind_and_id(self) -> (i32, i64) {
+        match self {
+            ParsedPeer::User(id) => (KIND_USER, id),
+            ParsedPeer::Chat(id) => (KIND_CHAT, id),
+            ParsedPeer::Channel(id) => (KIND_CHANNEL, id),
+        }
+    }
+
+    pub fn write_tl(self, w: &mut Writer) {
+        match self {
+            ParsedPeer::User(uid) => {
+                w.write_u32(TL_PEER_USER);
+                w.write_i64(uid);
+            }
+            ParsedPeer::Chat(cid) => {
+                w.write_u32(TL_PEER_CHAT);
+                w.write_i64(cid);
+            }
+            ParsedPeer::Channel(chid) => {
+                w.write_u32(TL_PEER_CHANNEL);
+                w.write_i64(chid);
+            }
+        }
+    }
+}
+
+pub fn parse_input_peer(r: &mut Reader, self_id: Option<i64>) -> Result<Option<ParsedPeer>, TlError> {
+    let ctor = r.read_u32()?;
+    match ctor {
+        TL_INPUT_PEER_EMPTY => Ok(None),
+        TL_INPUT_PEER_SELF => Ok(Some(ParsedPeer::User(self_id.unwrap_or(0)))),
+        TL_INPUT_PEER_USER => {
+            let uid = r.read_i64()?;
+            let _ah = r.read_i64()?;
+            Ok(Some(ParsedPeer::User(uid)))
+        }
+        TL_INPUT_PEER_USER_L131 => {
+            let uid = r.read_i32()? as i64;
+            let _ah = r.read_i64()?;
+            Ok(Some(ParsedPeer::User(uid)))
+        }
+        TL_INPUT_PEER_CHAT => {
+            let cid = r.read_i64()?;
+            Ok(Some(ParsedPeer::Chat(cid)))
+        }
+        TL_INPUT_PEER_CHAT_L131 => {
+            let cid = r.read_i32()? as i64;
+            Ok(Some(ParsedPeer::Chat(cid)))
+        }
+        TL_INPUT_PEER_CHANNEL => {
+            let chid = r.read_i64()?;
+            let _ah = r.read_i64()?;
+            Ok(Some(ParsedPeer::Channel(chid)))
+        }
+        TL_INPUT_PEER_CHANNEL_L131 => {
+            let chid = r.read_i32()? as i64;
+            let _ah = r.read_i64()?;
+            Ok(Some(ParsedPeer::Channel(chid)))
+        }
+        TL_INPUT_PEER_USER_FROM_MSG => {
+            let _ = parse_input_peer(r, self_id)?;
+            let _msg_id = r.read_i32()?;
+            let uid = r.read_i64()?;
+            Ok(Some(ParsedPeer::User(uid)))
+        }
+        TL_INPUT_PEER_CHANNEL_FROM_MSG => {
+            let _ = parse_input_peer(r, self_id)?;
+            let _msg_id = r.read_i32()?;
+            let chid = r.read_i64()?;
+            Ok(Some(ParsedPeer::Channel(chid)))
+        }
+        other => Err(TlError::UnknownConstructor {
+            id: other,
+            context: "InputPeer",
+        }),
+    }
+}
+
+pub fn parse_input_channel(r: &mut Reader, self_id: Option<i64>) -> Result<Option<i64>, TlError> {
+    let ctor = r.read_u32()?;
+    match ctor {
+        TL_INPUT_CHANNEL_EMPTY => Ok(None),
+        TL_INPUT_CHANNEL => {
+            let cid = r.read_i64()?;
+            let _ah = r.read_i64()?;
+            Ok(Some(cid))
+        }
+        TL_INPUT_CHANNEL_L131 => {
+            let cid = r.read_i32()? as i64;
+            let _ah = r.read_i64()?;
+            Ok(Some(cid))
+        }
+        TL_INPUT_CHANNEL_FROM_MSG => {
+            let _ = parse_input_peer(r, self_id)?;
+            let _msg_id = r.read_i32()?;
+            let cid = r.read_i64()?;
+            Ok(Some(cid))
+        }
+        other => Err(TlError::UnknownConstructor {
+            id: other,
+            context: "InputChannel",
+        }),
+    }
+}
+
+pub fn parse_input_reply_to(r: &mut Reader, self_id: Option<i64>) -> Result<Option<i32>, TlError> {
+    let ctor = r.read_u32()?;
+    match ctor {
+        TL_INPUT_REPLY_TO_MESSAGE | TL_INPUT_REPLY_TO_MESSAGE_LEGACY => {
+            let flags = r.read_i32()?;
+            let reply_to_msg_id = r.read_i32()?;
+            if flags & (1 << 0) != 0 {
+                let _top_msg_id = r.read_i32()?;
+            }
+            if flags & (1 << 1) != 0 {
+                let _ = parse_input_peer(r, self_id)?;
+            }
+            if flags & (1 << 2) != 0 {
+                let _quote_text = r.read_string()?;
+            }
+            if flags & (1 << 3) != 0 {
+                skip_message_entities(r)?;
+            }
+            if flags & (1 << 4) != 0 {
+                let _quote_offset = r.read_i32()?;
+            }
+            if flags & (1 << 5) != 0 {
+                let _ = parse_input_peer(r, self_id)?;
+            }
+            if flags & (1 << 6) != 0 {
+                let _todo_item_id = r.read_i32()?;
+            }
+            if flags & (1 << 7) != 0 {
+                let _poll_option = r.read_bytes()?;
+            }
+            Ok(Some(reply_to_msg_id))
+        }
+        TL_INPUT_REPLY_TO_STORY => {
+            let _ = parse_input_peer(r, self_id)?;
+            let _story_id = r.read_i32()?;
+            Ok(None)
+        }
+        TL_INPUT_REPLY_TO_STORY_L173 => {
+            let _u_ctor = r.read_u32()?;
+            let _uid = r.read_i64()?;
+            let _ah = r.read_i64()?;
+            let _story_id = r.read_i32()?;
+            Ok(None)
+        }
+        TL_INPUT_REPLY_TO_EPHEMERAL => {
+            let id = r.read_i32()?;
+            Ok(Some(id))
+        }
+        TL_INPUT_REPLY_TO_MONOFORUM => {
+            let _ = parse_input_peer(r, self_id)?;
+            Ok(None)
+        }
+        other => Err(TlError::UnknownConstructor {
+            id: other,
+            context: "InputReplyTo",
+        }),
+    }
+}
+
+fn skip_message_entities(r: &mut Reader) -> Result<(), TlError> {
+    let count = r.read_vector_header()?;
+    for _ in 0..count {
+        let e_ctor = r.read_u32()?;
+        let _offset = r.read_i32()?;
+        let _length = r.read_i32()?;
+        match e_ctor {
+            0x76a6d327 | 0xfa04579d => {
+                // textUrl / pre -> extra string
+                let _ = r.read_string()?;
+            }
+            0xdc7b1140 => {
+                // mentionName -> user_id:long
+                let _ = r.read_i64()?;
+            }
+            0xc8cf05f8 => {
+                // customEmoji -> document_id:long
+                let _ = r.read_i64()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+// --- Rich Layer-232 Encoders ------------------------------------------------
+
+pub fn encode_tl_user(
+    user: &User,
+    self_id: Option<i64>,
+    is_contact: bool,
+    is_mutual: bool,
+    is_online: bool,
+) -> Vec<u8> {
+    const FLAG_0: i32 = 1 << 0; // access_hash
+    const FLAG_1: i32 = 1 << 1; // first_name
+    const FLAG_2: i32 = 1 << 2; // last_name
+    const FLAG_3: i32 = 1 << 3; // username
+    const FLAG_4: i32 = 1 << 4; // phone
+    const FLAG_5: i32 = 1 << 5; // photo
+    const FLAG_6: i32 = 1 << 6; // status
+    const FLAG_10: i32 = 1 << 10; // self
+    const FLAG_11: i32 = 1 << 11; // contact
+    const FLAG_12: i32 = 1 << 12; // mutual_contact
+    const FLAG_14: i32 = 1 << 14; // bot
+    const FLAG_17: i32 = 1 << 17; // verified
+    const FLAG_24: i32 = 1 << 24; // scam
+    const FLAG_26: i32 = 1 << 26; // fake
+    const FLAG_28: i32 = 1 << 28; // premium
+
+    let include_last = !user.last_name.is_empty() && user.last_name != "User";
+    let has_username = user.username.as_ref().is_some_and(|u| !u.is_empty());
+    let has_photo = user.photo_id.is_some();
+
+    let mut flags = FLAG_0 | FLAG_1 | FLAG_4 | FLAG_6;
+    if Some(user.id) == self_id {
+        flags |= FLAG_10;
+    }
+    if is_contact {
+        flags |= FLAG_11;
+    }
+    if is_mutual {
+        flags |= FLAG_12;
+    }
+    if include_last {
+        flags |= FLAG_2;
+    }
+    if has_username {
+        flags |= FLAG_3;
+    }
+    if has_photo {
+        flags |= FLAG_5;
+    }
+    if user.flags_bitmask & USER_FLAG_VERIFIED != 0 {
+        flags |= FLAG_17;
+    }
+    if user.flags_bitmask & USER_FLAG_PREMIUM != 0 {
+        flags |= FLAG_28;
+    }
+    if user.flags_bitmask & USER_FLAG_SCAM != 0 {
+        flags |= FLAG_24;
+    }
+    if user.flags_bitmask & USER_FLAG_FAKE != 0 {
+        flags |= FLAG_26;
+    }
+    let is_bot = user.flags_bitmask & USER_FLAG_BOT != 0;
+    if is_bot {
+        flags |= FLAG_14;
+    }
+
+    let now = now_unix();
+    let mut w = Writer::new();
+    w.write_u32(TL_USER);
+    w.write_i32(flags);
+    w.write_i32(0); // flags2
+    w.write_i64(user.id);
+    w.write_i64(user.access_hash); // FLAG_0
+    w.write_string(&user.first_name); // FLAG_1
+    if include_last {
+        w.write_string(&user.last_name); // FLAG_2
+    }
+    if let Some(uname) = user.username.as_ref().filter(|u| !u.is_empty()) {
+        w.write_string(uname); // FLAG_3
+    }
+    w.write_string(&user.phone); // FLAG_4
+    if let Some(pid) = user.photo_id {
+        // TL_userProfilePhoto#82d1f706 { flags:0 photo_id:long dc_id:int }
+        w.write_u32(0x82d1_f706);
+        w.write_i32(0); // flags
+        w.write_i64(pid);
+        w.write_i32(user.photo_dc_id.unwrap_or(2));
+    }
+    // FLAG_6: UserStatus
+    if is_online {
+        w.write_u32(TL_USER_STATUS_ONLINE);
+        w.write_i32(now + 300);
+    } else {
+        w.write_u32(TL_USER_STATUS_OFFLINE);
+        w.write_i32(now - 60);
+    }
+    if is_bot {
+        w.write_i32(1); // bot_info_version (FLAG_14)
+    }
+    w.into_vec()
+}
+
+pub fn encode_tl_chat(chat: &ChatRow, viewer_id: i64) -> Vec<u8> {
+    let mut flags = 0i32;
+    if chat.creator_id == viewer_id {
+        flags |= 1 << 0; // creator
+    }
+    let mut w = Writer::new();
+    w.write_u32(TL_CHAT);
+    w.write_i32(flags);
+    w.write_i64(chat.chat_id);
+    w.write_string(&chat.title);
+    w.write_u32(TL_CHAT_PHOTO_EMPTY);
+    w.write_i32(chat.participants_count);
+    w.write_i32(chat.date_unix);
+    w.write_i32(chat.version);
+    w.into_vec()
+}
+
+pub fn encode_tl_channel(chan: &ChannelRow, viewer_id: i64) -> Vec<u8> {
+    let mut flags = (1 << 13) | (1 << 17); // access_hash | participants_count
+    if chan.creator_id == viewer_id {
+        flags |= 1 << 0; // creator
+    }
+    if chan.is_broadcast {
+        flags |= 1 << 5; // broadcast
+    }
+    if chan.is_megagroup {
+        flags |= 1 << 8; // megagroup
+    }
+    if chan.is_forum {
+        flags |= 1 << 30; // forum
+    }
+    let has_username = chan.username.as_ref().is_some_and(|u| !u.is_empty());
+    if has_username {
+        flags |= 1 << 6;
+    }
+
+    let mut w = Writer::new();
+    w.write_u32(TL_CHANNEL);
+    w.write_i32(flags);
+    w.write_i32(0); // flags2
+    w.write_i64(chan.channel_id);
+    w.write_i64(chan.access_hash); // FLAG_13
+    w.write_string(&chan.title);
+    if let Some(uname) = chan.username.as_ref().filter(|u| !u.is_empty()) {
+        w.write_string(uname); // FLAG_6
+    }
+    w.write_u32(TL_CHAT_PHOTO_EMPTY);
+    w.write_i32(chan.date_unix);
+    w.write_i32(chan.participants_count); // FLAG_17
+    w.into_vec()
+}
+
+pub fn encode_tl_message(row: &MessageRow, is_broadcast_post: bool) -> Vec<u8> {
+    const FLAG_1_OUT: i32 = 1 << 1;
+    const FLAG_3_REPLY: i32 = 1 << 3;
+    const FLAG_7_ENTITIES: i32 = 1 << 7;
+    const FLAG_8_FROM_ID: i32 = 1 << 8;
+    const FLAG_9_MEDIA: i32 = 1 << 9;
+    const FLAG_14_POST: i32 = 1 << 14;
+    const FLAG_15_EDIT_DATE: i32 = 1 << 15;
+    const FLAG_25_TTL: i32 = 1 << 25;
+
+    let mut flags = 0i32;
+    if row.is_out {
+        flags |= FLAG_1_OUT;
+    }
+    if is_broadcast_post {
+        flags |= FLAG_14_POST;
+    } else if row.sender_user_id != 0 {
+        flags |= FLAG_8_FROM_ID;
+    }
+    if row.reply_to_msg_id.is_some() {
+        flags |= FLAG_3_REPLY;
+    }
+    if row.media_tl.is_some() {
+        flags |= FLAG_9_MEDIA;
+    }
+    if row.entities_tl.is_some() {
+        flags |= FLAG_7_ENTITIES;
+    }
+    if row.edit_date_unix.is_some() {
+        flags |= FLAG_15_EDIT_DATE;
+    }
+    if row.ttl_period.is_some() {
+        flags |= FLAG_25_TTL;
+    }
+
+    let mut w = Writer::new();
+    w.write_u32(TL_MESSAGE);
+    w.write_i32(flags);
+    w.write_i32(0); // flags2 (Layer 232!)
+    w.write_i32(row.msg_id);
+    if flags & FLAG_8_FROM_ID != 0 {
+        w.write_u32(TL_PEER_USER);
+        w.write_i64(row.sender_user_id);
+    }
+    // peer_id
+    match row.peer_kind {
+        KIND_CHAT => {
+            w.write_u32(TL_PEER_CHAT);
+            w.write_i64(row.peer_id);
+        }
+        KIND_CHANNEL => {
+            w.write_u32(TL_PEER_CHANNEL);
+            w.write_i64(row.peer_id);
+        }
+        _ => {
+            w.write_u32(TL_PEER_USER);
+            w.write_i64(row.peer_id);
+        }
+    }
+    if let Some(reply_id) = row.reply_to_msg_id {
+        w.write_u32(TL_MESSAGE_REPLY_HEADER);
+        w.write_i32(1 << 4); // FLAG_4: reply_to_msg_id
+        w.write_i32(reply_id);
+    }
+    w.write_i32(row.date_unix);
+    w.write_string(&row.message_text);
+    if let Some(media) = &row.media_tl {
+        w.write_raw(media);
+    }
+    if let Some(ents) = &row.entities_tl {
+        w.write_raw(ents);
+    }
+    if let Some(edit_ts) = row.edit_date_unix {
+        w.write_i32(edit_ts);
+    }
+    if let Some(ttl) = row.ttl_period {
+        w.write_i32(ttl);
+    }
+    w.into_vec()
+}
+
+pub fn encode_tl_dialog(dlg: &DialogRow, channel_pts: Option<i32>) -> Vec<u8> {
+    let mut flags = 0i32;
+    if channel_pts.is_some() {
+        flags |= 1 << 0; // pts
+    }
+    if dlg.pinned {
+        flags |= 1 << 2; // pinned
+    }
+    let mut w = Writer::new();
+    w.write_u32(TL_DIALOG);
+    w.write_i32(flags);
+    match dlg.peer_kind {
+        KIND_CHAT => {
+            w.write_u32(TL_PEER_CHAT);
+            w.write_i64(dlg.peer_id);
+        }
+        KIND_CHANNEL => {
+            w.write_u32(TL_PEER_CHANNEL);
+            w.write_i64(dlg.peer_id);
+        }
+        _ => {
+            w.write_u32(TL_PEER_USER);
+            w.write_i64(dlg.peer_id);
+        }
+    }
+    w.write_i32(dlg.top_message_id);
+    w.write_i32(dlg.read_inbox_max_id);
+    w.write_i32(dlg.read_outbox_max_id);
+    w.write_i32(dlg.unread_count);
+    w.write_i32(0); // unread_mentions_count
+    w.write_i32(0); // unread_reactions_count
+    w.write_i32(0); // unread_poll_votes_count (Layer 232!)
+    w.write_u32(TL_PEER_NOTIFY_SETTINGS);
+    w.write_i32(0); // flags
+    if let Some(cpts) = channel_pts {
+        w.write_i32(cpts);
+    }
+    w.into_vec()
+}
+
+pub fn encode_updates_state(pts: i32, qts: i32, unread_count: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATES_STATE);
+    w.write_i32(pts);
+    w.write_i32(qts);
+    w.write_i32(now_unix());
+    w.write_i32(0); // seq
+    w.write_i32(unread_count);
+    w.into_vec()
+}
+
+pub fn encode_tl_updates(
+    updates: &[Vec<u8>],
+    users: &[Vec<u8>],
+    chats: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATES);
+    w.write_vector_header(updates.len());
+    for u in updates {
+        w.write_raw(u);
+    }
+    w.write_vector_header(users.len());
+    for u in users {
+        w.write_raw(u);
+    }
+    w.write_vector_header(chats.len());
+    for c in chats {
+        w.write_raw(c);
+    }
+    w.write_i32(now_unix());
+    w.write_i32(0); // seq
+    w.into_vec()
+}
+
+pub fn encode_update_new_message(msg_bytes: &[u8], pts: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_NEW_MESSAGE);
+    w.write_raw(msg_bytes);
+    w.write_i32(pts);
+    w.write_i32(1); // pts_count
+    w.into_vec()
+}
+
+pub fn encode_update_edit_message(msg_bytes: &[u8], pts: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_EDIT_MESSAGE);
+    w.write_raw(msg_bytes);
+    w.write_i32(pts);
+    w.write_i32(1);
+    w.into_vec()
+}
+
+pub fn encode_update_delete_messages(ids: &[i32], pts: i32, pts_count: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_DELETE_MESSAGES);
+    w.write_vector_header(ids.len());
+    for &id in ids {
+        w.write_i32(id);
+    }
+    w.write_i32(pts);
+    w.write_i32(pts_count);
+    w.into_vec()
+}
+
+pub fn encode_update_read_inbox(
+    peer: ParsedPeer,
+    max_id: i32,
+    still_unread: i32,
+    pts: i32,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_READ_HISTORY_INBOX);
+    w.write_i32(0); // flags
+    peer.write_tl(&mut w);
+    w.write_i32(max_id);
+    w.write_i32(still_unread);
+    w.write_i32(pts);
+    w.write_i32(1);
+    w.into_vec()
+}
+
+pub fn encode_update_read_outbox(peer: ParsedPeer, max_id: i32, pts: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_READ_HISTORY_OUTBOX);
+    peer.write_tl(&mut w);
+    w.write_i32(max_id);
+    w.write_i32(pts);
+    w.write_i32(1);
+    w.into_vec()
+}
+
+pub fn encode_update_new_channel_message(msg_bytes: &[u8], channel_pts: i32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_NEW_CHANNEL_MESSAGE);
+    w.write_raw(msg_bytes);
+    w.write_i32(channel_pts);
+    w.write_i32(1);
+    w.into_vec()
+}
+
+pub fn encode_update_short_sent_message(
+    msg_id: i32,
+    pts: i32,
+    date: i32,
+    media_tl: Option<&[u8]>,
+    ttl_period: Option<i32>,
+) -> Vec<u8> {
+    let mut flags = 1 << 1; // out = true
+    if media_tl.is_some() {
+        flags |= 1 << 9;
+    }
+    if ttl_period.is_some() {
+        flags |= 1 << 25;
+    }
+    let mut w = Writer::new();
+    w.write_u32(TL_UPDATE_SHORT_SENT_MESSAGE);
+    w.write_i32(flags);
+    w.write_i32(msg_id);
+    w.write_i32(pts);
+    w.write_i32(1); // pts_count
+    w.write_i32(date);
+    if let Some(m) = media_tl {
+        w.write_raw(m);
+    }
+    if let Some(ttl) = ttl_period {
+        w.write_i32(ttl);
+    }
+    w.into_vec()
+}
+
+// --- Dispatcher Stateful Handlers -------------------------------------------
+
+impl Dispatcher {
+    pub fn render_user_for_viewer(&self, user: &User, viewer_id: Option<i64>) -> Vec<u8> {
+        let is_online = self.hub().is_user_online(user.id);
+        encode_tl_user(user, viewer_id, false, false, is_online)
+    }
+
+    fn require_auth_user(&self, ctx: &mut ConnContext) -> Result<User, Vec<u8>> {
+        if let Some(u) = &ctx.user {
+            if let Some(fresh) = self.store().user_by_id(u.id) {
+                ctx.user = Some(fresh.clone());
+                return Ok(fresh);
+            }
+            return Ok(u.clone());
+        }
+        Err(rpc_error(401, "AUTH_KEY_UNREGISTERED"))
+    }
+
+    // --- Profile & Username (`account.*`) -----------------------------------
+
+    pub fn account_update_profile(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(flags) = r.read_i32() else {
+            return rpc_error(400, "PROFILE_MALFORMED");
+        };
+        let first_name = if flags & 1 != 0 {
+            r.read_string().ok().map(str::to_string)
+        } else {
+            None
+        };
+        let last_name = if flags & 2 != 0 {
+            r.read_string().ok().map(str::to_string)
+        } else {
+            None
+        };
+        let about = if flags & 4 != 0 {
+            r.read_string().ok().map(str::to_string)
+        } else {
+            None
+        };
+        match self.store().acid().update_profile(
+            me.id,
+            first_name.as_deref(),
+            last_name.as_deref(),
+            about.as_deref(),
+        ) {
+            Ok(row) => {
+                let updated = User::from(row);
+                ctx.user = Some(updated.clone());
+                self.render_user_for_viewer(&updated, Some(updated.id))
+            }
+            Err(_) => rpc_error(400, "USER_ID_INVALID"),
+        }
+    }
+
+    pub fn account_check_username(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let Ok(username) = r.read_string() else {
+            return rpc_error(400, "USERNAME_INVALID");
+        };
+        let self_id = ctx.user.as_ref().map(|u| u.id);
+        match self.store().acid().is_username_available(username, self_id) {
+            Ok(avail) => {
+                let mut w = Writer::new();
+                w.write_bool(avail);
+                w.into_vec()
+            }
+            Err(StoreError::UsernameInvalid) => rpc_error(400, "USERNAME_INVALID"),
+            Err(_) => rpc_error(400, "USERNAME_OCCUPIED"),
+        }
+    }
+
+    pub fn account_update_username(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(username) = r.read_string() else {
+            return rpc_error(400, "USERNAME_INVALID");
+        };
+        match self.store().acid().update_username(me.id, username) {
+            Ok(row) => {
+                let updated = User::from(row);
+                ctx.user = Some(updated.clone());
+                self.render_user_for_viewer(&updated, Some(updated.id))
+            }
+            Err(StoreError::UsernameInvalid) => rpc_error(400, "USERNAME_INVALID"),
+            Err(StoreError::UsernameOccupied) => rpc_error(400, "USERNAME_OCCUPIED"),
+            Err(_) => rpc_error(400, "USERNAME_INVALID"),
+        }
+    }
+
+    // --- Contacts & Global Search (`contacts.*`) ----------------------------
+
+    pub fn contacts_get_contacts(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let _hash = r.read_i64().unwrap_or(0);
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let rows = self.store().acid().list_contacts(me.id);
+        let mut w = Writer::new();
+        w.write_u32(TL_CONTACTS_CONTACTS);
+        w.write_vector_header(rows.len());
+        for (u, mutual) in &rows {
+            w.write_u32(TL_CONTACT);
+            w.write_i64(u.user_id);
+            w.write_bool(*mutual);
+        }
+        w.write_i32(rows.len() as i32); // saved_count
+        w.write_vector_header(rows.len());
+        for (u, mutual) in rows {
+            let usr = User::from(u);
+            let online = self.hub().is_user_online(usr.id);
+            w.write_raw(&encode_tl_user(&usr, Some(me.id), true, mutual, online));
+        }
+        w.into_vec()
+    }
+
+    pub fn contacts_import_contacts(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(count) = r.read_vector_header() else {
+            return rpc_error(400, "CONTACTS_MALFORMED");
+        };
+        let mut imported = Vec::new();
+        let mut users = BTreeMap::new();
+
+        for _ in 0..count.min(500) {
+            let Ok(ctor) = r.read_u32() else {
+                break;
+            };
+            let flags = if ctor == TL_INPUT_PHONE_CONTACT {
+                r.read_i32().unwrap_or(0)
+            } else if ctor == TL_INPUT_PHONE_CONTACT_LEGACY {
+                0
+            } else {
+                break;
+            };
+            let (Ok(client_id), Ok(phone), Ok(fname), Ok(lname)) = (
+                r.read_i64(),
+                r.read_string(),
+                r.read_string(),
+                r.read_string(),
+            ) else {
+                break;
+            };
+            let phone = phone.to_string();
+            let fname = fname.to_string();
+            let lname = lname.to_string();
+            if flags & 1 != 0 {
+                // TL_textWithEntities#751f3146 { text:string entities:Vector }
+                let _ = r.read_u32();
+                let _ = r.read_string();
+                let _ = skip_message_entities(r);
+            }
+            if let Some(found) = self.store().user_by_phone(&phone) {
+                let _ = self
+                    .store()
+                    .acid()
+                    .add_contact(me.id, found.id, &fname, &lname, &phone);
+                imported.push((found.id, client_id));
+                users.insert(found.id, found);
+            }
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_CONTACTS_IMPORTED_CONTACTS);
+        w.write_vector_header(imported.len());
+        for (uid, cid) in &imported {
+            w.write_u32(TL_IMPORTED_CONTACT);
+            w.write_i64(*uid);
+            w.write_i64(*cid);
+        }
+        w.write_vector_header(0); // popular_invites
+        w.write_vector_header(0); // retry_contacts
+        w.write_vector_header(users.len());
+        for u in users.values() {
+            let online = self.hub().is_user_online(u.id);
+            w.write_raw(&encode_tl_user(u, Some(me.id), true, false, online));
+        }
+        w.into_vec()
+    }
+
+    pub fn contacts_add_contact(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        has_flags: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = if has_flags {
+            r.read_i32().unwrap_or(0)
+        } else {
+            0
+        };
+        let Ok(Some(target)) = self.resolve_input_user_pub(ctx, r) else {
+            return rpc_error(400, "CONTACT_ID_INVALID");
+        };
+        let fname = r.read_string().unwrap_or(&target.first_name).to_string();
+        let lname = r.read_string().unwrap_or(&target.last_name).to_string();
+        let phone = normalize_phone(r.read_string().unwrap_or(&target.phone));
+        if flags & (1 << 1) != 0 {
+            let _ = r.read_u32();
+            let _ = r.read_string();
+            let _ = skip_message_entities(r);
+        }
+        let _ = self
+            .store()
+            .acid()
+            .add_contact(me.id, target.id, &fname, &lname, &phone);
+        let online = self.hub().is_user_online(target.id);
+        let u_bytes = encode_tl_user(&target, Some(me.id), true, false, online);
+        encode_tl_updates(&[], &[u_bytes], &[])
+    }
+
+    pub fn contacts_delete_contacts(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(count) = r.read_vector_header() else {
+            return rpc_error(400, "CONTACT_ID_INVALID");
+        };
+        let mut ids = Vec::new();
+        let mut users = Vec::new();
+        for _ in 0..count.min(200) {
+            if let Ok(Some(u)) = self.resolve_input_user_pub(ctx, r) {
+                ids.push(u.id);
+                users.push(self.render_user_for_viewer(&u, Some(me.id)));
+            }
+        }
+        let _ = self.store().acid().delete_contacts(me.id, &ids);
+        encode_tl_updates(&[], &users, &[])
+    }
+
+    pub fn contacts_get_statuses(&self, ctx: &mut ConnContext) -> Vec<u8> {
+        let Some(me) = ctx.user.as_ref() else {
+            let mut w = Writer::new();
+            w.write_vector_header(0);
+            return w.into_vec();
+        };
+        let contacts = self.store().acid().list_contacts(me.id);
+        let now = now_unix();
+        let mut w = Writer::new();
+        w.write_vector_header(contacts.len());
+        for (u, _) in contacts {
+            w.write_u32(TL_CONTACT_STATUS);
+            w.write_i64(u.user_id);
+            if self.hub().is_user_online(u.user_id) {
+                w.write_u32(TL_USER_STATUS_ONLINE);
+                w.write_i32(now + 300);
+            } else {
+                w.write_u32(TL_USER_STATUS_OFFLINE);
+                w.write_i32(now - 60);
+            }
+        }
+        w.into_vec()
+    }
+
+    pub fn contacts_get_blocked() -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_CONTACTS_BLOCKED);
+        w.write_vector_header(0); // blocked
+        w.write_vector_header(0); // chats
+        w.write_vector_header(0); // users
+        w.into_vec()
+    }
+
+    pub fn contacts_resolve_username(
+        &self,
+        ctx: &ConnContext,
+        r: &mut Reader,
+        has_flags: bool,
+    ) -> Vec<u8> {
+        let flags = if has_flags {
+            r.read_i32().unwrap_or(0)
+        } else {
+            0
+        };
+        let Ok(username) = r.read_string() else {
+            return rpc_error(400, "USERNAME_INVALID");
+        };
+        let username = username.to_string();
+        if flags & 1 != 0 {
+            let _referer = r.read_string();
+        }
+        let viewer_id = ctx.user.as_ref().map(|u| u.id);
+
+        if let Some(u) = self.store().user_by_username(&username) {
+            let mut w = Writer::new();
+            w.write_u32(TL_CONTACTS_RESOLVED_PEER);
+            ParsedPeer::User(u.id).write_tl(&mut w);
+            w.write_vector_header(0); // chats
+            w.write_vector_header(1); // users
+            w.write_raw(&self.render_user_for_viewer(&u, viewer_id));
+            return w.into_vec();
+        }
+        if let Some(chan) = self.store().acid().channel_by_username(&username) {
+            let mut w = Writer::new();
+            w.write_u32(TL_CONTACTS_RESOLVED_PEER);
+            ParsedPeer::Channel(chan.channel_id).write_tl(&mut w);
+            w.write_vector_header(1); // chats
+            w.write_raw(&encode_tl_channel(&chan, viewer_id.unwrap_or(0)));
+            w.write_vector_header(0); // users
+            return w.into_vec();
+        }
+        rpc_error(400, "USERNAME_NOT_OCCUPIED")
+    }
+
+    pub fn contacts_resolve_phone(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let Ok(phone) = r.read_string() else {
+            return rpc_error(400, "PHONE_NOT_OCCUPIED");
+        };
+        let viewer_id = ctx.user.as_ref().map(|u| u.id);
+        if let Some(u) = self.store().user_by_phone(phone) {
+            let mut w = Writer::new();
+            w.write_u32(TL_CONTACTS_RESOLVED_PEER);
+            ParsedPeer::User(u.id).write_tl(&mut w);
+            w.write_vector_header(0); // chats
+            w.write_vector_header(1); // users
+            w.write_raw(&self.render_user_for_viewer(&u, viewer_id));
+            return w.into_vec();
+        }
+        rpc_error(400, "PHONE_NOT_OCCUPIED")
+    }
+
+    pub fn contacts_search(
+        &self,
+        ctx: &ConnContext,
+        r: &mut Reader,
+        has_flags: bool,
+    ) -> Vec<u8> {
+        if has_flags {
+            let _flags = r.read_i32();
+        }
+        let q = r.read_string().unwrap_or("").to_string();
+        let limit = r.read_i32().unwrap_or(20).clamp(1, 50) as usize;
+        let viewer_id = ctx.user.as_ref().map(|u| u.id);
+
+        let user_rows = self.store().acid().search_users(&q, limit);
+        let chan_rows = self.store().acid().search_channels(&q, limit);
+
+        let mut w = Writer::new();
+        w.write_u32(TL_CONTACTS_FOUND);
+        w.write_vector_header(0); // my_results
+        w.write_vector_header(user_rows.len() + chan_rows.len()); // results
+        for u in &user_rows {
+            ParsedPeer::User(u.user_id).write_tl(&mut w);
+        }
+        for c in &chan_rows {
+            ParsedPeer::Channel(c.channel_id).write_tl(&mut w);
+        }
+        w.write_vector_header(chan_rows.len()); // chats
+        for c in &chan_rows {
+            w.write_raw(&encode_tl_channel(c, viewer_id.unwrap_or(0)));
+        }
+        w.write_vector_header(user_rows.len()); // users
+        for u in user_rows {
+            let usr = User::from(u);
+            w.write_raw(&self.render_user_for_viewer(&usr, viewer_id));
+        }
+        w.into_vec()
+    }
+
+    // --- Updates State & `updates.getDifference` ----------------------------
+
+    pub fn updates_get_state_real(&self, ctx: &mut ConnContext) -> Vec<u8> {
+        let Some(me) = self.require_auth_user(ctx).ok() else {
+            return encode_updates_state(1, 0, 0);
+        };
+        let (pts, qts, unread) = self.store().acid().user_state(me.id);
+        encode_updates_state(pts, qts, unread)
+    }
+
+    pub fn updates_get_difference_real(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        is_legacy: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(_) => {
+                let mut w = Writer::new();
+                w.write_u32(TL_UPDATES_DIFFERENCE_EMPTY);
+                w.write_i32(now_unix());
+                w.write_i32(0);
+                return w.into_vec();
+            }
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let from_pts = r.read_i32().unwrap_or(0);
+        let mut limit = 200usize;
+        if is_legacy {
+            if flags & 1 != 0 {
+                limit = r.read_i32().unwrap_or(200).clamp(1, 1000) as usize;
+            }
+        } else {
+            if flags & (1 << 1) != 0 {
+                limit = r.read_i32().unwrap_or(200).clamp(1, 1000) as usize;
+            }
+            if flags & (1 << 2) != 0 {
+                let _pts_total_limit = r.read_i32();
+            }
+        }
+        let _date = r.read_i32();
+        let _qts = r.read_i32();
+
+        let (current_pts, events) = self
+            .store()
+            .acid()
+            .get_pts_difference(me.id, from_pts, limit);
+        if events.is_empty() {
+            let mut w = Writer::new();
+            w.write_u32(TL_UPDATES_DIFFERENCE_EMPTY);
+            w.write_i32(now_unix());
+            w.write_i32(0);
+            return w.into_vec();
+        }
+
+        let mut new_messages: Vec<Vec<u8>> = Vec::new();
+        let mut other_updates: Vec<Vec<u8>> = Vec::new();
+        let mut user_ids: BTreeSet<i64> = BTreeSet::new();
+        let mut chat_ids: BTreeSet<i64> = BTreeSet::new();
+        user_ids.insert(me.id);
+
+        for ev in events {
+            match ev.update_kind {
+                PTS_KIND_NEW_MESSAGE => {
+                    if let Some(m) = self.store().acid().get_message(me.id, ev.msg_id) {
+                        self.collect_msg_refs(&m, &mut user_ids, &mut chat_ids);
+                        new_messages.push(encode_tl_message(&m, false));
+                    }
+                }
+                PTS_KIND_EDIT_MESSAGE => {
+                    if let Some(m) = self.store().acid().get_message(me.id, ev.msg_id) {
+                        self.collect_msg_refs(&m, &mut user_ids, &mut chat_ids);
+                        let mb = encode_tl_message(&m, false);
+                        other_updates.push(encode_update_edit_message(&mb, ev.pts));
+                    }
+                }
+                PTS_KIND_DELETE_MESSAGES => {
+                    other_updates.push(encode_update_delete_messages(&[ev.msg_id], ev.pts, 1));
+                }
+                PTS_KIND_READ_INBOX => {
+                    let peer = peer_from_kind(ev.peer_kind, ev.peer_id);
+                    other_updates.push(encode_update_read_inbox(
+                        peer,
+                        ev.msg_id,
+                        ev.extra_i32,
+                        ev.pts,
+                    ));
+                }
+                PTS_KIND_READ_OUTBOX => {
+                    let peer = peer_from_kind(ev.peer_kind, ev.peer_id);
+                    other_updates.push(encode_update_read_outbox(peer, ev.msg_id, ev.pts));
+                }
+                _ => {}
+            }
+        }
+
+        let (_, qts, unread) = self.store().acid().user_state(me.id);
+        let mut w = Writer::new();
+        w.write_u32(TL_UPDATES_DIFFERENCE);
+        w.write_vector_header(new_messages.len());
+        for m in &new_messages {
+            w.write_raw(m);
+        }
+        w.write_vector_header(0); // new_encrypted_messages
+        w.write_vector_header(other_updates.len());
+        for u in &other_updates {
+            w.write_raw(u);
+        }
+        let chats = self.encode_chats_set(&chat_ids, me.id);
+        w.write_vector_header(chats.len());
+        for c in &chats {
+            w.write_raw(c);
+        }
+        let users = self.encode_users_set(&user_ids, Some(me.id));
+        w.write_vector_header(users.len());
+        for u in &users {
+            w.write_raw(u);
+        }
+        w.write_raw(&encode_updates_state(current_pts, qts, unread));
+        w.into_vec()
+    }
+
+    // --- Direct, Group & Channel Messaging (`messages.*`) -------------------
+
+    pub fn messages_send_message(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        legacy_int_reply: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(flags) = r.read_i32() else {
+            return rpc_error(400, "PEER_ID_INVALID");
+        };
+        let Ok(Some(peer)) = parse_input_peer(r, Some(me.id)) else {
+            return rpc_error(400, "PEER_ID_INVALID");
+        };
+        let reply_to_msg_id = if flags & 1 != 0 {
+            if legacy_int_reply {
+                r.read_i32().ok()
+            } else {
+                match parse_input_reply_to(r, Some(me.id)) {
+                    Ok(v) => v,
+                    Err(_) => return rpc_error(400, "REPLY_TO_INVALID"),
+                }
+            }
+        } else {
+            None
+        };
+        let (Ok(text), Ok(random_id)) = (r.read_string(), r.read_i64()) else {
+            return rpc_error(400, "MESSAGE_EMPTY");
+        };
+        let text = text.to_string();
+        if text.trim().is_empty() {
+            return rpc_error(400, "MESSAGE_EMPTY");
+        }
+
+        self.deliver_outgoing_message(ctx, &me, peer, random_id, &text, reply_to_msg_id, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_outgoing_message(
+        &self,
+        ctx: &ConnContext,
+        me: &User,
+        peer: ParsedPeer,
+        random_id: i64,
+        text: &str,
+        reply_to_msg_id: Option<i32>,
+        media_tl: Option<&[u8]>,
+        ttl_period: Option<i32>,
+    ) -> Vec<u8> {
+        match peer {
+            ParsedPeer::User(target_uid) => {
+                let recip_id = if target_uid == 0 { me.id } else { target_uid };
+                let outcome = match self.store().acid().send_direct_message(
+                    me.id,
+                    recip_id,
+                    random_id,
+                    text,
+                    reply_to_msg_id,
+                    media_tl,
+                    None,
+                    ttl_period,
+                ) {
+                    Ok(o) => o,
+                    Err(StoreError::NotFound) => return rpc_error(400, "USER_ID_INVALID"),
+                    Err(_) => return rpc_error(500, "STORAGE_ERROR"),
+                };
+
+                if !outcome.deduplicated {
+                    // Push to sender's OTHER active devices/sessions!
+                    let sender_msg_tl = encode_tl_message(&outcome.sender_msg, false);
+                    let sender_upd = encode_update_new_message(&sender_msg_tl, outcome.sender_pts);
+                    let mut sender_users = vec![self.render_user_for_viewer(me, Some(me.id))];
+                    if recip_id != me.id {
+                        if let Some(ru) = self.store().user_by_id(recip_id) {
+                            sender_users.push(self.render_user_for_viewer(&ru, Some(me.id)));
+                        }
+                    }
+                    let push_self = encode_tl_updates(&[sender_upd], &sender_users, &[]);
+                    self.hub().push_to_user(me.id, Some(ctx.conn_id), push_self);
+
+                    // Real-time push to recipient!
+                    if let Some((recip_msg, recip_pts)) = &outcome.recipient_msg {
+                        let recip_msg_tl = encode_tl_message(recip_msg, false);
+                        let recip_upd = encode_update_new_message(&recip_msg_tl, *recip_pts);
+                        let mut r_users = vec![self.render_user_for_viewer(me, Some(recip_id))];
+                        if let Some(ru) = self.store().user_by_id(recip_id) {
+                            r_users.push(self.render_user_for_viewer(&ru, Some(recip_id)));
+                        }
+                        let push_recip = encode_tl_updates(&[recip_upd], &r_users, &[]);
+                        self.hub().push_to_user(recip_id, None, push_recip);
+                    }
+                }
+
+                if media_tl.is_some() {
+                    let sender_msg_tl = encode_tl_message(&outcome.sender_msg, false);
+                    let upd = encode_update_new_message(&sender_msg_tl, outcome.sender_pts);
+                    let users = vec![self.render_user_for_viewer(me, Some(me.id))];
+                    encode_tl_updates(&[upd], &users, &[])
+                } else {
+                    encode_update_short_sent_message(
+                        outcome.sender_msg.msg_id,
+                        outcome.sender_pts,
+                        outcome.sender_msg.date_unix,
+                        media_tl,
+                        ttl_period,
+                    )
+                }
+            }
+            ParsedPeer::Chat(chat_id) => {
+                let outcome = match self.store().acid().send_chat_message(
+                    me.id,
+                    chat_id,
+                    random_id,
+                    text,
+                    reply_to_msg_id,
+                    media_tl,
+                ) {
+                    Ok(o) => o,
+                    Err(StoreError::NotFound) => return rpc_error(400, "CHAT_ID_INVALID"),
+                    Err(StoreError::PermissionDenied) => {
+                        return rpc_error(403, "CHAT_WRITE_FORBIDDEN")
+                    }
+                    Err(_) => return rpc_error(500, "STORAGE_ERROR"),
+                };
+
+                for (member_uid, m_row, m_pts) in &outcome.member_deliveries {
+                    let mb = encode_tl_message(m_row, false);
+                    let upd = encode_update_new_message(&mb, *m_pts);
+                    let chat_tl = encode_tl_chat(&outcome.chat, *member_uid);
+                    let sender_tl = self.render_user_for_viewer(me, Some(*member_uid));
+                    let push = encode_tl_updates(&[upd], &[sender_tl], &[chat_tl]);
+                    self.hub().push_to_user(*member_uid, None, push);
+                }
+
+                let sender_mb = encode_tl_message(&outcome.sender_msg, false);
+                let upd = encode_update_new_message(&sender_mb, outcome.sender_pts);
+                let chat_tl = encode_tl_chat(&outcome.chat, me.id);
+                let sender_tl = self.render_user_for_viewer(me, Some(me.id));
+                let resp = encode_tl_updates(&[upd], &[sender_tl], &[chat_tl]);
+                self.hub()
+                    .push_to_user(me.id, Some(ctx.conn_id), resp.clone());
+                resp
+            }
+            ParsedPeer::Channel(channel_id) => {
+                let outcome = match self.store().acid().send_channel_message(
+                    me.id,
+                    channel_id,
+                    random_id,
+                    text,
+                    reply_to_msg_id,
+                    media_tl,
+                ) {
+                    Ok(o) => o,
+                    Err(StoreError::NotFound) => return rpc_error(400, "CHANNEL_INVALID"),
+                    Err(_) => return rpc_error(500, "STORAGE_ERROR"),
+                };
+                let is_post = outcome.channel.is_broadcast && !outcome.channel.is_megagroup;
+
+                for &sub_uid in &outcome.subscriber_ids {
+                    let mut m_view = outcome.msg.clone();
+                    m_view.is_out = sub_uid == me.id;
+                    let mb = encode_tl_message(&m_view, is_post);
+                    let upd = encode_update_new_channel_message(&mb, outcome.channel_pts);
+                    let ch_tl = encode_tl_channel(&outcome.channel, sub_uid);
+                    let u_tl = self.render_user_for_viewer(me, Some(sub_uid));
+                    let push = encode_tl_updates(&[upd], &[u_tl], &[ch_tl]);
+                    let exclude = if sub_uid == me.id {
+                        Some(ctx.conn_id)
+                    } else {
+                        None
+                    };
+                    self.hub().push_to_user(sub_uid, exclude, push);
+                }
+
+                let mut self_msg = outcome.msg;
+                self_msg.is_out = true;
+                let mb = encode_tl_message(&self_msg, is_post);
+                let upd = encode_update_new_channel_message(&mb, outcome.channel_pts);
+                let ch_tl = encode_tl_channel(&outcome.channel, me.id);
+                let u_tl = self.render_user_for_viewer(me, Some(me.id));
+                encode_tl_updates(&[upd], &[u_tl], &[ch_tl])
+            }
+        }
+    }
+
+    pub fn messages_get_dialogs_real(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let flags = r.read_i32().unwrap_or(0);
+        if flags & (1 << 1) != 0 {
+            let _folder_id = r.read_i32();
+        }
+        let _offset_date = r.read_i32();
+        let _offset_id = r.read_i32();
+        let _ = parse_input_peer(r, ctx.user.as_ref().map(|u| u.id));
+        let limit = r.read_i32().unwrap_or(100).clamp(1, 200) as usize;
+        let _hash = r.read_i64();
+
+        let Some(me) = self.require_auth_user(ctx).ok() else {
+            let mut w = Writer::new();
+            w.write_u32(TL_MESSAGES_DIALOGS);
+            for _ in 0..4 {
+                w.write_vector_header(0);
+            }
+            return w.into_vec();
+        };
+
+        let dlg_rows = self.store().acid().get_dialogs(me.id, limit);
+        let mut dialogs_tl = Vec::with_capacity(dlg_rows.len());
+        let mut messages_tl = Vec::new();
+        let mut user_ids = BTreeSet::new();
+        let mut chat_ids = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+        if !dlg_rows.is_empty() {
+            user_ids.insert(me.id);
+        }
+
+        for d in &dlg_rows {
+            match d.peer_kind {
+                KIND_USER => {
+                    user_ids.insert(d.peer_id);
+                    dialogs_tl.push(encode_tl_dialog(d, None));
+                    if d.top_message_id > 0 {
+                        if let Some(m) = self.store().acid().get_message(me.id, d.top_message_id) {
+                            self.collect_msg_refs(&m, &mut user_ids, &mut chat_ids);
+                            messages_tl.push(encode_tl_message(&m, false));
+                        }
+                    }
+                }
+                KIND_CHAT => {
+                    chat_ids.insert(d.peer_id);
+                    dialogs_tl.push(encode_tl_dialog(d, None));
+                    if d.top_message_id > 0 {
+                        if let Some(m) = self.store().acid().get_message(me.id, d.top_message_id) {
+                            self.collect_msg_refs(&m, &mut user_ids, &mut chat_ids);
+                            messages_tl.push(encode_tl_message(&m, false));
+                        }
+                    }
+                }
+                KIND_CHANNEL => {
+                    channel_ids.insert(d.peer_id);
+                    let chan = self.store().acid().channel_by_id(d.peer_id);
+                    let c_pts = chan.as_ref().map(|c| c.channel_pts).unwrap_or(1);
+                    dialogs_tl.push(encode_tl_dialog(d, Some(c_pts)));
+                    if d.top_message_id > 0 {
+                        if let Some(m) = self.store().acid().get_channel_message(
+                            d.peer_id,
+                            d.top_message_id,
+                            me.id,
+                        ) {
+                            user_ids.insert(m.sender_user_id);
+                            let is_post = chan
+                                .as_ref()
+                                .is_some_and(|c| c.is_broadcast && !c.is_megagroup);
+                            messages_tl.push(encode_tl_message(&m, is_post));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut chats_tl = self.encode_chats_set(&chat_ids, me.id);
+        for cid in channel_ids {
+            if let Some(c) = self.store().acid().channel_by_id(cid) {
+                chats_tl.push(encode_tl_channel(&c, me.id));
+            }
+        }
+        let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_DIALOGS);
+        w.write_vector_header(dialogs_tl.len());
+        for d in &dialogs_tl {
+            w.write_raw(d);
+        }
+        w.write_vector_header(messages_tl.len());
+        for m in &messages_tl {
+            w.write_raw(m);
+        }
+        w.write_vector_header(chats_tl.len());
+        for c in &chats_tl {
+            w.write_raw(c);
+        }
+        w.write_vector_header(users_tl.len());
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.into_vec()
+    }
+
+    pub fn messages_get_peer_dialogs_real(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        is_pinned: bool,
+    ) -> Vec<u8> {
+        let Some(me) = self.require_auth_user(ctx).ok() else {
+            let mut w = Writer::new();
+            w.write_u32(TL_MESSAGES_PEER_DIALOGS);
+            for _ in 0..4 {
+                w.write_vector_header(0);
+            }
+            w.write_raw(&encode_updates_state(1, 0, 0));
+            return w.into_vec();
+        };
+
+        let mut target_dialogs = Vec::new();
+        if is_pinned {
+            for d in self.store().acid().get_dialogs(me.id, 50) {
+                if d.pinned {
+                    target_dialogs.push(d);
+                }
+            }
+        } else if let Ok(count) = r.read_vector_header() {
+            for _ in 0..count.min(50) {
+                // InputDialogPeer#fcaafeb7 { peer:InputPeer }
+                let Ok(ctor) = r.read_u32() else { break };
+                let peer_opt = if ctor == 0xfcaafeb7 {
+                    parse_input_peer(r, Some(me.id)).ok().flatten()
+                } else {
+                    break;
+                };
+                if let Some(p) = peer_opt {
+                    let (pk, pid) = p.kind_and_id();
+                    if let Some(d) = self.store().acid().get_dialog(me.id, pk, pid) {
+                        target_dialogs.push(d);
+                    }
+                }
+            }
+        }
+
+        let mut dialogs_tl = Vec::new();
+        let mut messages_tl = Vec::new();
+        let mut user_ids = BTreeSet::new();
+        let mut chat_ids = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+        user_ids.insert(me.id);
+
+        for d in &target_dialogs {
+            let c_pts = if d.peer_kind == KIND_CHANNEL {
+                channel_ids.insert(d.peer_id);
+                self.store()
+                    .acid()
+                    .channel_by_id(d.peer_id)
+                    .map(|c| c.channel_pts)
+            } else {
+                if d.peer_kind == KIND_USER {
+                    user_ids.insert(d.peer_id);
+                } else if d.peer_kind == KIND_CHAT {
+                    chat_ids.insert(d.peer_id);
+                }
+                None
+            };
+            dialogs_tl.push(encode_tl_dialog(d, c_pts));
+            if d.top_message_id > 0 && d.peer_kind != KIND_CHANNEL {
+                if let Some(m) = self.store().acid().get_message(me.id, d.top_message_id) {
+                    messages_tl.push(encode_tl_message(&m, false));
+                }
+            }
+        }
+
+        let mut chats_tl = self.encode_chats_set(&chat_ids, me.id);
+        for cid in channel_ids {
+            if let Some(c) = self.store().acid().channel_by_id(cid) {
+                chats_tl.push(encode_tl_channel(&c, me.id));
+            }
+        }
+        let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+        let (pts, qts, unread) = self.store().acid().user_state(me.id);
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_PEER_DIALOGS);
+        w.write_vector_header(dialogs_tl.len());
+        for d in &dialogs_tl {
+            w.write_raw(d);
+        }
+        w.write_vector_header(messages_tl.len());
+        for m in &messages_tl {
+            w.write_raw(m);
+        }
+        w.write_vector_header(chats_tl.len());
+        for c in &chats_tl {
+            w.write_raw(c);
+        }
+        w.write_vector_header(users_tl.len());
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.write_raw(&encode_updates_state(pts, qts, unread));
+        w.into_vec()
+    }
+
+    pub fn messages_get_history(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(peer)) = parse_input_peer(r, Some(me.id)) else {
+            return rpc_error(400, "PEER_ID_INVALID");
+        };
+        let offset_id = r.read_i32().unwrap_or(0);
+        let _offset_date = r.read_i32();
+        let _add_offset = r.read_i32();
+        let limit = r.read_i32().unwrap_or(50).clamp(1, 100) as usize;
+
+        match peer {
+            ParsedPeer::Channel(channel_id) => {
+                let Some(chan) = self.store().acid().channel_by_id(channel_id) else {
+                    return rpc_error(400, "CHANNEL_INVALID");
+                };
+                let rows =
+                    self.store()
+                        .acid()
+                        .get_channel_history(channel_id, offset_id, limit, me.id);
+                let is_post = chan.is_broadcast && !chan.is_megagroup;
+                let mut user_ids = BTreeSet::new();
+                user_ids.insert(me.id);
+                let mut msgs_tl = Vec::with_capacity(rows.len());
+                for m in &rows {
+                    user_ids.insert(m.sender_user_id);
+                    msgs_tl.push(encode_tl_message(m, is_post));
+                }
+                let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+                let mut w = Writer::new();
+                w.write_u32(TL_MESSAGES_CHANNEL_MESSAGES);
+                w.write_i32(0); // flags
+                w.write_i32(chan.channel_pts);
+                w.write_i32(msgs_tl.len() as i32); // count
+                w.write_vector_header(msgs_tl.len());
+                for m in &msgs_tl {
+                    w.write_raw(m);
+                }
+                w.write_vector_header(0); // topics (Layer 232!)
+                w.write_vector_header(1); // chats
+                w.write_raw(&encode_tl_channel(&chan, me.id));
+                w.write_vector_header(users_tl.len());
+                for u in &users_tl {
+                    w.write_raw(u);
+                }
+                w.into_vec()
+            }
+            other => {
+                let (pk, pid) = other.kind_and_id();
+                let pid = if pk == KIND_USER && pid == 0 {
+                    me.id
+                } else {
+                    pid
+                };
+                let rows = self
+                    .store()
+                    .acid()
+                    .get_history(me.id, pk, pid, offset_id, limit);
+                let mut user_ids = BTreeSet::new();
+                let mut chat_ids = BTreeSet::new();
+                user_ids.insert(me.id);
+                if pk == KIND_USER {
+                    user_ids.insert(pid);
+                } else if pk == KIND_CHAT {
+                    chat_ids.insert(pid);
+                }
+                let mut msgs_tl = Vec::with_capacity(rows.len());
+                for m in &rows {
+                    self.collect_msg_refs(m, &mut user_ids, &mut chat_ids);
+                    msgs_tl.push(encode_tl_message(m, false));
+                }
+                let chats_tl = self.encode_chats_set(&chat_ids, me.id);
+                let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+                let mut w = Writer::new();
+                w.write_u32(TL_MESSAGES_MESSAGES);
+                w.write_vector_header(msgs_tl.len());
+                for m in &msgs_tl {
+                    w.write_raw(m);
+                }
+                w.write_vector_header(0); // topics (Layer 232!)
+                w.write_vector_header(chats_tl.len());
+                for c in &chats_tl {
+                    w.write_raw(c);
+                }
+                w.write_vector_header(users_tl.len());
+                for u in &users_tl {
+                    w.write_raw(u);
+                }
+                w.into_vec()
+            }
+        }
+    }
+
+    pub fn messages_get_messages(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        boxed_input_msg: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let ids = read_message_id_list(r, boxed_input_msg);
+        let mut user_ids = BTreeSet::new();
+        let mut chat_ids = BTreeSet::new();
+        user_ids.insert(me.id);
+        let mut msgs_tl = Vec::new();
+        for id in ids {
+            if let Some(m) = self.store().acid().get_message(me.id, id) {
+                self.collect_msg_refs(&m, &mut user_ids, &mut chat_ids);
+                msgs_tl.push(encode_tl_message(&m, false));
+            }
+        }
+        let chats_tl = self.encode_chats_set(&chat_ids, me.id);
+        let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_MESSAGES);
+        w.write_vector_header(msgs_tl.len());
+        for m in &msgs_tl {
+            w.write_raw(m);
+        }
+        w.write_vector_header(0); // topics
+        w.write_vector_header(chats_tl.len());
+        for c in &chats_tl {
+            w.write_raw(c);
+        }
+        w.write_vector_header(users_tl.len());
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.into_vec()
+    }
+
+    pub fn messages_edit_message(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(flags) = r.read_i32() else {
+            return rpc_error(400, "MESSAGE_ID_INVALID");
+        };
+        let _ = parse_input_peer(r, Some(me.id));
+        let Ok(msg_id) = r.read_i32() else {
+            return rpc_error(400, "MESSAGE_ID_INVALID");
+        };
+        let new_text = if flags & (1 << 11) != 0 {
+            r.read_string().unwrap_or("").to_string()
+        } else {
+            return rpc_error(400, "MESSAGE_NOT_MODIFIED");
+        };
+
+        let outcome = match self
+            .store()
+            .acid()
+            .edit_direct_message(me.id, msg_id, &new_text)
+        {
+            Ok(o) => o,
+            Err(StoreError::NotFound) => return rpc_error(400, "MESSAGE_ID_INVALID"),
+            Err(StoreError::PermissionDenied) => return rpc_error(403, "MESSAGE_AUTHOR_REQUIRED"),
+            Err(_) => return rpc_error(500, "STORAGE_ERROR"),
+        };
+
+        if let Some((peer_msg, peer_pts)) = &outcome.peer_updated {
+            let p_tl = encode_tl_message(peer_msg, false);
+            let p_upd = encode_update_edit_message(&p_tl, *peer_pts);
+            let mut p_users = vec![self.render_user_for_viewer(&me, Some(peer_msg.owner_user_id))];
+            if let Some(pu) = self.store().user_by_id(peer_msg.owner_user_id) {
+                p_users.push(self.render_user_for_viewer(&pu, Some(peer_msg.owner_user_id)));
+            }
+            let push = encode_tl_updates(&[p_upd], &p_users, &[]);
+            self.hub().push_to_user(peer_msg.owner_user_id, None, push);
+        }
+
+        let actor_tl = encode_tl_message(&outcome.actor_msg, false);
+        let upd = encode_update_edit_message(&actor_tl, outcome.actor_pts);
+        let users = vec![self.render_user_for_viewer(&me, Some(me.id))];
+        let resp = encode_tl_updates(&[upd], &users, &[]);
+        self.hub()
+            .push_to_user(me.id, Some(ctx.conn_id), resp.clone());
+        resp
+    }
+
+    pub fn messages_delete_messages(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let revoke = flags & 1 != 0;
+        let ids = read_message_id_list(r, false);
+
+        let Ok(outcome) = self.store().acid().delete_messages(me.id, &ids, revoke) else {
+            return rpc_error(500, "STORAGE_ERROR");
+        };
+
+        for batch in &outcome.peer_batches {
+            let upd = encode_update_delete_messages(
+                &batch.msg_ids,
+                batch.pts,
+                batch.msg_ids.len() as i32,
+            );
+            let push = encode_tl_updates(&[upd], &[], &[]);
+            self.hub().push_to_user(batch.user_id, None, push);
+        }
+
+        if outcome.deleted_count > 0 {
+            let upd =
+                encode_update_delete_messages(&ids, outcome.actor_pts, outcome.deleted_count);
+            let push_self = encode_tl_updates(&[upd], &[], &[]);
+            self.hub()
+                .push_to_user(me.id, Some(ctx.conn_id), push_self);
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_AFFECTED_MESSAGES);
+        w.write_i32(outcome.actor_pts);
+        w.write_i32(outcome.deleted_count);
+        w.into_vec()
+    }
+
+    pub fn messages_delete_history(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let just_clear = flags & 1 != 0;
+        let revoke = flags & 2 != 0;
+        let Ok(Some(peer)) = parse_input_peer(r, Some(me.id)) else {
+            return rpc_error(400, "PEER_ID_INVALID");
+        };
+        let max_id = r.read_i32().unwrap_or(0);
+        let (pk, pid) = peer.kind_and_id();
+        let pid = if pk == KIND_USER && pid == 0 {
+            me.id
+        } else {
+            pid
+        };
+
+        let Ok(outcome) = self
+            .store()
+            .acid()
+            .delete_history(me.id, pk, pid, max_id, just_clear, revoke)
+        else {
+            return rpc_error(500, "STORAGE_ERROR");
+        };
+
+        for batch in &outcome.peer_batches {
+            let upd = encode_update_delete_messages(
+                &batch.msg_ids,
+                batch.pts,
+                batch.msg_ids.len() as i32,
+            );
+            let push = encode_tl_updates(&[upd], &[], &[]);
+            self.hub().push_to_user(batch.user_id, None, push);
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_AFFECTED_HISTORY);
+        w.write_i32(outcome.actor_pts);
+        w.write_i32(outcome.deleted_count);
+        w.write_i32(0); // offset = 0 (done)
+        w.into_vec()
+    }
+
+    pub fn messages_read_history(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(peer)) = parse_input_peer(r, Some(me.id)) else {
+            return rpc_error(400, "PEER_ID_INVALID");
+        };
+        let max_id = r.read_i32().unwrap_or(0);
+        let (pk, pid) = peer.kind_and_id();
+        let pid = if pk == KIND_USER && pid == 0 {
+            me.id
+        } else {
+            pid
+        };
+
+        let Ok(outcome) = self.store().acid().read_history(me.id, pk, pid, max_id) else {
+            return rpc_error(500, "STORAGE_ERROR");
+        };
+
+        // Push live double-checkmark (`updateReadHistoryOutbox`) to sender!
+        if let Some((peer_uid, peer_max_id, peer_pts)) = outcome.outbox_peer {
+            let upd = encode_update_read_outbox(ParsedPeer::User(me.id), peer_max_id, peer_pts);
+            let push = encode_tl_updates(&[upd], &[], &[]);
+            self.hub().push_to_user(peer_uid, None, push);
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_AFFECTED_MESSAGES);
+        w.write_i32(outcome.reader_pts);
+        w.write_i32(1);
+        w.into_vec()
+    }
+
+    pub fn messages_set_typing(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let Some(me) = self.require_auth_user(ctx).ok() else {
+            let mut w = Writer::new();
+            w.write_bool(true);
+            return w.into_vec();
+        };
+        let flags = r.read_i32().unwrap_or(0);
+        let Ok(Some(peer)) = parse_input_peer(r, Some(me.id)) else {
+            let mut w = Writer::new();
+            w.write_bool(true);
+            return w.into_vec();
+        };
+        let top_msg_id = if flags & 1 != 0 {
+            r.read_i32().ok()
+        } else {
+            None
+        };
+        let action_bytes = r.read_raw(r.remaining()).unwrap_or(&[]).to_vec();
+        if let ParsedPeer::User(uid) = peer {
+            if uid != 0 && uid != me.id && action_bytes.len() >= 4 {
+                let mut u = Writer::new();
+                u.write_u32(TL_UPDATE_USER_TYPING);
+                if let Some(tid) = top_msg_id {
+                    u.write_i32(1);
+                    u.write_i64(me.id);
+                    u.write_i32(tid);
+                } else {
+                    u.write_i32(0);
+                    u.write_i64(me.id);
+                }
+                u.write_raw(&action_bytes);
+                let sender_tl = self.render_user_for_viewer(&me, Some(uid));
+                let push = encode_tl_updates(&[u.into_vec()], &[sender_tl], &[]);
+                self.hub().push_to_user(uid, None, push);
+            }
+        }
+        let mut w = Writer::new();
+        w.write_bool(true);
+        w.into_vec()
+    }
+
+    pub fn messages_create_chat(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        has_flags: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        if has_flags {
+            let _flags = r.read_i32();
+        }
+        let Ok(count) = r.read_vector_header() else {
+            return rpc_error(400, "USERS_TOO_FEW");
+        };
+        let mut member_ids = Vec::new();
+        let mut users_tl = vec![self.render_user_for_viewer(&me, Some(me.id))];
+        for _ in 0..count.min(200) {
+            if let Ok(Some(u)) = self.resolve_input_user_pub(ctx, r) {
+                member_ids.push(u.id);
+                users_tl.push(self.render_user_for_viewer(&u, Some(me.id)));
+            }
+        }
+        let Ok(title) = r.read_string() else {
+            return rpc_error(400, "CHAT_TITLE_EMPTY");
+        };
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return rpc_error(400, "CHAT_TITLE_EMPTY");
+        }
+        let Ok(chat) = self.store().acid().create_chat(me.id, &title, &member_ids) else {
+            return rpc_error(500, "STORAGE_ERROR");
+        };
+        let chat_tl = encode_tl_chat(&chat, me.id);
+        let updates = encode_tl_updates(&[], &users_tl, &[chat_tl]);
+
+        if has_flags {
+            // Layer 232 TL_messages_createChat#0034a818 -> TL_messages_invitedUsers#7f5defa6
+            let mut w = Writer::new();
+            w.write_u32(TL_MESSAGES_INVITED_USERS);
+            w.write_raw(&updates);
+            w.write_vector_header(0); // missing_invitees
+            w.into_vec()
+        } else {
+            updates
+        }
+    }
+
+    // --- Channels & Supergroups (`channels.*`, `updates.getChannelDifference`) ---
+
+    pub fn channels_create_channel(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(flags) = r.read_i32() else {
+            return rpc_error(400, "CHAT_TITLE_EMPTY");
+        };
+        let is_broadcast = flags & (1 << 0) != 0;
+        let is_megagroup = flags & (1 << 1) != 0 || !is_broadcast;
+        let is_forum = flags & (1 << 5) != 0;
+        let (Ok(title), Ok(about)) = (r.read_string(), r.read_string()) else {
+            return rpc_error(400, "CHAT_TITLE_EMPTY");
+        };
+        let title = title.trim().to_string();
+        let about = about.trim().to_string();
+        if title.is_empty() {
+            return rpc_error(400, "CHAT_TITLE_EMPTY");
+        }
+        let Ok(chan) = self.store().acid().create_channel(
+            me.id,
+            &title,
+            &about,
+            is_broadcast,
+            is_megagroup,
+            is_forum,
+        ) else {
+            return rpc_error(500, "STORAGE_ERROR");
+        };
+        let ch_tl = encode_tl_channel(&chan, me.id);
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        encode_tl_updates(&[], &[me_tl], &[ch_tl])
+    }
+
+    pub fn channels_get_channels(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let viewer_id = ctx.user.as_ref().map_or(0, |u| u.id);
+        let Ok(count) = r.read_vector_header() else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let mut chats = Vec::new();
+        for _ in 0..count.min(100) {
+            if let Ok(Some(cid)) = parse_input_channel(r, Some(viewer_id)) {
+                if let Some(c) = self.store().acid().channel_by_id(cid) {
+                    chats.push(encode_tl_channel(&c, viewer_id));
+                }
+            }
+        }
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_CHATS);
+        w.write_vector_header(chats.len());
+        for c in &chats {
+            w.write_raw(c);
+        }
+        w.into_vec()
+    }
+
+    pub fn channels_get_full_channel(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let viewer_id = ctx.user.as_ref().map_or(0, |u| u.id);
+        let Ok(Some(cid)) = parse_input_channel(r, Some(viewer_id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Some(chan) = self.store().acid().channel_by_id(cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let dlg = self.store().acid().get_dialog(viewer_id, KIND_CHANNEL, cid);
+        let read_in = dlg.as_ref().map_or(0, |d| d.read_inbox_max_id);
+        let read_out = dlg.as_ref().map_or(0, |d| d.read_outbox_max_id);
+        let unread = dlg.as_ref().map_or(0, |d| d.unread_count);
+
+        let mut full_flags = (1 << 0) | (1 << 3); // participants_count | can_view_participants
+        if chan.creator_id == viewer_id {
+            full_flags |= 1 << 6; // can_set_username
+        }
+
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_CHAT_FULL);
+        // full_chat: TL_channelFull#a04e8d3a
+        w.write_u32(TL_CHANNEL_FULL);
+        w.write_i32(full_flags);
+        w.write_i32(0); // flags2
+        w.write_i64(chan.channel_id);
+        w.write_string(&chan.about);
+        w.write_i32(chan.participants_count); // FLAG_0
+        w.write_i32(read_in);
+        w.write_i32(read_out);
+        w.write_i32(unread);
+        // chat_photo: TL_photoEmpty#2331b22d { id:0 }
+        w.write_u32(TL_PHOTO_EMPTY);
+        w.write_i64(0);
+        // notify_settings: TL_peerNotifySettings#99622c0c { flags:0 }
+        w.write_u32(TL_PEER_NOTIFY_SETTINGS);
+        w.write_i32(0);
+        w.write_vector_header(0); // bot_info
+        w.write_i32(chan.channel_pts); // pts
+        // chats & users vectors on TL_messages_chatFull
+        w.write_vector_header(1);
+        w.write_raw(&encode_tl_channel(&chan, viewer_id));
+        w.write_vector_header(0);
+        w.into_vec()
+    }
+
+    pub fn channels_join_channel(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Ok(chan) = self.store().acid().join_channel(me.id, cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let ch_tl = encode_tl_channel(&chan, me.id);
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        let updates = encode_tl_updates(&[], &[me_tl], &[ch_tl]);
+        // Layer 232 ShuzaGramMod: TL_channels_joinChannel deserializes ChatInviteJoinResult!
+        // Note: Standard older layers expect Updates, whereas ShuzaGramMod Layer 232 expects
+        // TL_chatInviteJoinResultOk#445663a7 when layer >= 230!
+        if ctx.negotiated_layer == 0 || ctx.negotiated_layer >= 230 {
+            let mut w = Writer::new();
+            w.write_u32(TL_CHAT_INVITE_JOIN_RESULT_OK);
+            w.write_raw(&updates);
+            w.into_vec()
+        } else {
+            updates
+        }
+    }
+
+    pub fn channels_leave_channel(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Ok(chan) = self.store().acid().leave_channel(me.id, cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let ch_tl = encode_tl_channel(&chan, me.id);
+        let me_tl = self.render_user_for_viewer(&me, Some(me.id));
+        encode_tl_updates(&[], &[me_tl], &[ch_tl])
+    }
+
+    pub fn channels_check_username(&self, ctx: &ConnContext, r: &mut Reader) -> Vec<u8> {
+        let viewer_id = ctx.user.as_ref().map(|u| u.id);
+        let _ = parse_input_channel(r, viewer_id);
+        let Ok(username) = r.read_string() else {
+            return rpc_error(400, "USERNAME_INVALID");
+        };
+        match self.store().acid().is_username_available(username, None) {
+            Ok(avail) => {
+                let mut w = Writer::new();
+                w.write_bool(avail);
+                w.into_vec()
+            }
+            Err(StoreError::UsernameInvalid) => rpc_error(400, "USERNAME_INVALID"),
+            Err(_) => rpc_error(400, "USERNAME_OCCUPIED"),
+        }
+    }
+
+    pub fn channels_update_username(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Ok(username) = r.read_string() else {
+            return rpc_error(400, "USERNAME_INVALID");
+        };
+        match self
+            .store()
+            .acid()
+            .update_channel_username(me.id, cid, username)
+        {
+            Ok(_) => {
+                let mut w = Writer::new();
+                w.write_bool(true);
+                w.into_vec()
+            }
+            Err(StoreError::UsernameInvalid) => rpc_error(400, "USERNAME_INVALID"),
+            Err(StoreError::UsernameOccupied) => rpc_error(400, "USERNAME_OCCUPIED"),
+            Err(StoreError::PermissionDenied) => rpc_error(403, "CHAT_ADMIN_REQUIRED"),
+            Err(_) => rpc_error(400, "CHANNEL_INVALID"),
+        }
+    }
+
+    pub fn channels_read_history(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let max_id = r.read_i32().unwrap_or(0);
+        let _ = self.store().acid().read_channel_history(me.id, cid, max_id);
+        let mut w = Writer::new();
+        w.write_bool(true);
+        w.into_vec()
+    }
+
+    pub fn channels_get_messages(
+        &self,
+        ctx: &mut ConnContext,
+        r: &mut Reader,
+        boxed_input_msg: bool,
+    ) -> Vec<u8> {
+        let me = match self.require_auth_user(ctx) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let Ok(Some(cid)) = parse_input_channel(r, Some(me.id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Some(chan) = self.store().acid().channel_by_id(cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let ids = read_message_id_list(r, boxed_input_msg);
+        let is_post = chan.is_broadcast && !chan.is_megagroup;
+        let mut user_ids = BTreeSet::new();
+        user_ids.insert(me.id);
+        let mut msgs_tl = Vec::new();
+        for id in ids {
+            if let Some(m) = self.store().acid().get_channel_message(cid, id, me.id) {
+                user_ids.insert(m.sender_user_id);
+                msgs_tl.push(encode_tl_message(&m, is_post));
+            }
+        }
+        let users_tl = self.encode_users_set(&user_ids, Some(me.id));
+        let mut w = Writer::new();
+        w.write_u32(TL_MESSAGES_CHANNEL_MESSAGES);
+        w.write_i32(0); // flags
+        w.write_i32(chan.channel_pts);
+        w.write_i32(msgs_tl.len() as i32);
+        w.write_vector_header(msgs_tl.len());
+        for m in &msgs_tl {
+            w.write_raw(m);
+        }
+        w.write_vector_header(0); // topics
+        w.write_vector_header(1); // chats
+        w.write_raw(&encode_tl_channel(&chan, me.id));
+        w.write_vector_header(users_tl.len());
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.into_vec()
+    }
+
+    pub fn updates_get_channel_difference(&self, ctx: &mut ConnContext, r: &mut Reader) -> Vec<u8> {
+        let viewer_id = ctx.user.as_ref().map_or(0, |u| u.id);
+        let _flags = r.read_i32().unwrap_or(0);
+        let Ok(Some(cid)) = parse_input_channel(r, Some(viewer_id)) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        // Skip ChannelMessagesFilter
+        if let Ok(f_ctor) = r.read_u32() {
+            if f_ctor == TL_CHANNEL_MESSAGES_FILTER {
+                let _ff = r.read_i32();
+                if let Ok(rc) = r.read_vector_header() {
+                    for _ in 0..rc.min(100) {
+                        let _ = r.read_u32(); // messageRange
+                        let _ = r.read_i32();
+                        let _ = r.read_i32();
+                    }
+                }
+            }
+        }
+        let from_pts = r.read_i32().unwrap_or(0);
+        let limit = r.read_i32().unwrap_or(50).clamp(1, 200) as usize;
+
+        let Some(chan) = self.store().acid().channel_by_id(cid) else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+        let Ok((c_pts, rows)) =
+            self.store()
+                .acid()
+                .get_channel_difference(cid, from_pts, limit, viewer_id)
+        else {
+            return rpc_error(400, "CHANNEL_INVALID");
+        };
+
+        if rows.is_empty() {
+            let mut w = Writer::new();
+            w.write_u32(TL_UPDATES_CHANNEL_DIFFERENCE_EMPTY);
+            w.write_i32(1); // FLAG_0: final = true
+            w.write_i32(c_pts);
+            return w.into_vec();
+        }
+
+        let is_post = chan.is_broadcast && !chan.is_megagroup;
+        let mut user_ids = BTreeSet::new();
+        let mut msgs_tl = Vec::with_capacity(rows.len());
+        for m in &rows {
+            user_ids.insert(m.sender_user_id);
+            msgs_tl.push(encode_tl_message(m, is_post));
+        }
+        let users_tl = self.encode_users_set(&user_ids, Some(viewer_id));
+
+        let mut w = Writer::new();
+        w.write_u32(TL_UPDATES_CHANNEL_DIFFERENCE);
+        w.write_i32(1); // FLAG_0: final = true
+        w.write_i32(c_pts);
+        w.write_vector_header(msgs_tl.len()); // new_messages
+        for m in &msgs_tl {
+            w.write_raw(m);
+        }
+        w.write_vector_header(0); // other_updates
+        w.write_vector_header(1); // chats
+        w.write_raw(&encode_tl_channel(&chan, viewer_id));
+        w.write_vector_header(users_tl.len()); // users
+        for u in &users_tl {
+            w.write_raw(u);
+        }
+        w.into_vec()
+    }
+
+    // --- Helpers ------------------------------------------------------------
+
+    fn collect_msg_refs(
+        &self,
+        m: &MessageRow,
+        user_ids: &mut BTreeSet<i64>,
+        chat_ids: &mut BTreeSet<i64>,
+    ) {
+        if m.sender_user_id != 0 {
+            user_ids.insert(m.sender_user_id);
+        }
+        if m.peer_kind == KIND_USER && m.peer_id != 0 {
+            user_ids.insert(m.peer_id);
+        } else if m.peer_kind == KIND_CHAT && m.peer_id != 0 {
+            chat_ids.insert(m.peer_id);
+        }
+    }
+
+    fn encode_users_set(&self, ids: &BTreeSet<i64>, viewer_id: Option<i64>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for &uid in ids {
+            if let Some(u) = self.store().user_by_id(uid) {
+                out.push(self.render_user_for_viewer(&u, viewer_id));
+            }
+        }
+        out
+    }
+
+    fn encode_chats_set(&self, ids: &BTreeSet<i64>, viewer_id: i64) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for &cid in ids {
+            if let Some(c) = self.store().acid().chat_by_id(cid) {
+                out.push(encode_tl_chat(&c, viewer_id));
+            }
+        }
+        out
+    }
+}
+
+fn read_message_id_list(r: &mut Reader, boxed_input_msg: bool) -> Vec<i32> {
+    let Ok(count) = r.read_vector_header() else {
+        return vec![];
+    };
+    let mut ids = Vec::with_capacity(count.min(200) as usize);
+    for _ in 0..count.min(200) {
+        if boxed_input_msg {
+            // inputMessageID#a676a322 / inputMessageReplyTo#bad88395 / inputMessagePinned#86872538
+            let Ok(ctor) = r.read_u32() else { break };
+            if ctor == 0x8687_2538 {
+                continue;
+            }
+            if let Ok(id) = r.read_i32() {
+                ids.push(id);
+            }
+        } else if let Ok(id) = r.read_i32() {
+            ids.push(id);
+        } else {
+            break;
+        }
+    }
+    ids
+}
+
+fn peer_from_kind(kind: i32, peer_id: i64) -> ParsedPeer {
+    match kind {
+        KIND_CHAT => ParsedPeer::Chat(peer_id),
+        KIND_CHANNEL => ParsedPeer::Channel(peer_id),
+        _ => ParsedPeer::User(peer_id),
+    }
+}
+
+fn now_unix() -> i32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i32)
+        .unwrap_or(0)
+}

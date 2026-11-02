@@ -4,11 +4,13 @@
 pub mod dispatch;
 pub mod egress;
 pub mod keystore;
+pub mod messaging;
 pub mod session;
 pub mod store;
 
 pub use dispatch::Dispatcher;
 pub use egress::SessionHub;
 pub use keystore::KeyStore;
+pub use messaging::*;
 pub use session::{Incoming, Session};
 pub use store::{Store, User};
