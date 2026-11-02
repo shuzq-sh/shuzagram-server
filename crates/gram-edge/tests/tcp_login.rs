@@ -12,6 +12,9 @@ const AUTH_SEND_CODE: u32 = 0xa677_244f;
 const AUTH_SIGN_IN: u32 = 0x8d52_a951;
 const AUTH_SENT_CODE: u32 = 0x5e00_2502;
 const AUTH_AUTHORIZATION: u32 = 0x2ea2_c0d4;
+const USER: u32 = 0xb1b8_cc83;
+const HELP_GET_CONFIG: u32 = 0xc4f9_186b;
+const CONFIG: u32 = 0xcc1a_241e;
 const RPC_RESULT: u32 = 0xf35c_6d01;
 const INVOKE_WITH_LAYER: u32 = 0xda9b_0d0d;
 const INIT_CONNECTION: u32 = 0xc1cd_5ea9;
@@ -57,6 +60,17 @@ fn full_login_over_tcp() {
 
     let mut client = Client::connect_and_handshake(addr, &rsa).expect("handshake");
 
+    // help.getConfig (what the client calls first) — must parse as a config.
+    let mut gc = Writer::new();
+    gc.write_u32(HELP_GET_CONFIG);
+    let (_id, reply) = client.invoke(&wrap(&gc.into_vec())).unwrap();
+    let result = unwrap_result(&reply);
+    assert_eq!(
+        Reader::new(&result).read_u32().unwrap(),
+        CONFIG,
+        "expected config"
+    );
+
     // auth.sendCode
     let mut sc = Writer::new();
     sc.write_u32(AUTH_SEND_CODE);
@@ -90,4 +104,17 @@ fn full_login_over_tcp() {
         AUTH_AUTHORIZATION,
         "expected auth.authorization (logged in)"
     );
+    // Parse the embedded TL_user as the client would (flags 0,1,4).
+    let _auth_flags = r.read_i32().unwrap();
+    assert_eq!(r.read_u32().unwrap(), USER);
+    let uflags = r.read_i32().unwrap();
+    let _uflags2 = r.read_i32().unwrap();
+    let id = r.read_i64().unwrap();
+    assert!(uflags & (1 << 0) != 0);
+    let _access_hash = r.read_i64().unwrap();
+    let first_name = r.read_string().unwrap().to_string();
+    let phone = r.read_string().unwrap().to_string();
+    assert!(id >= 1000);
+    assert_eq!(phone, "+99900099999");
+    assert_eq!(first_name, "ShuzaGram");
 }

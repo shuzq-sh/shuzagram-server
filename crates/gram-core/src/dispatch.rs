@@ -25,27 +25,56 @@ const PONG: u32 = 0x3477_73c5;
 const RPC_RESULT: u32 = 0xf35c_6d01;
 const RPC_ERROR: u32 = 0x2144_ca19;
 
-// --- auth ids (service-level ids are canonical; bodies are minimal) ---------
+// --- auth / help ids and layouts (verified against the client's TLRPC.java) -
 const AUTH_SEND_CODE: u32 = 0xa677_244f;
 const AUTH_SIGN_IN: u32 = 0x8d52_a951;
 const HELP_GET_CONFIG: u32 = 0xc4f9_186b;
 const AUTH_SENT_CODE: u32 = 0x5e00_2502;
 const AUTH_SENT_CODE_TYPE_APP: u32 = 0x3dbb_5986;
 const AUTH_AUTHORIZATION: u32 = 0x2ea2_c0d4;
-/// Minimal `user`-like constructor used by this server's own encoding.
-const USER_MIN: u32 = 0x5307_2a01;
+const USER: u32 = 0xb1b8_cc83;
+const CONFIG: u32 = 0xcc1a_241e;
+const DC_OPTION: u32 = 0x18b7_a10d;
 
 /// One object to send back to the client; the caller encrypts it.
 pub type Response = Vec<u8>;
 
+/// Advertised data-center endpoint (for `help.getConfig`).
+#[derive(Clone)]
+pub struct DcEndpoint {
+    pub dc_id: i32,
+    pub ip: String,
+    pub port: i32,
+}
+
+impl Default for DcEndpoint {
+    fn default() -> Self {
+        DcEndpoint {
+            dc_id: 2,
+            ip: "127.0.0.1".to_string(),
+            port: 8443,
+        }
+    }
+}
+
 /// Routes decrypted requests to handlers.
 pub struct Dispatcher {
     store: Arc<Store>,
+    dc: DcEndpoint,
 }
 
 impl Dispatcher {
     pub fn new(store: Arc<Store>) -> Self {
-        Dispatcher { store }
+        Dispatcher {
+            store,
+            dc: DcEndpoint::default(),
+        }
+    }
+
+    /// Set the data-center endpoint advertised by `help.getConfig`.
+    pub fn with_dc(mut self, dc: DcEndpoint) -> Self {
+        self.dc = dc;
+        self
     }
 
     /// Handle one decrypted inbound message body, returning zero or more reply
@@ -107,7 +136,7 @@ impl Dispatcher {
         match qid {
             AUTH_SEND_CODE => self.auth_send_code(r),
             AUTH_SIGN_IN => self.auth_sign_in(r),
-            HELP_GET_CONFIG => rpc_error(501, "HELP_GET_CONFIG_NOT_IMPLEMENTED"),
+            HELP_GET_CONFIG => config(&self.dc),
             other => rpc_error(400, &format!("UNKNOWN_METHOD_{other:#010x}")),
         }
     }
@@ -233,16 +262,92 @@ fn authorization(user: &User) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Minimal user encoding for this server's own schema.
+/// Encode `TL_user#b1b8cc83` with the minimal flag set the client accepts:
+/// FLAG_0 (access_hash) | FLAG_1 (first_name) | FLAG_4 (phone).
+/// Field order verified against the client's `TL_user.serializeToStream`.
 fn encode_user(user: &User) -> Vec<u8> {
+    const FLAG_0: i32 = 1 << 0; // access_hash
+    const FLAG_1: i32 = 1 << 1; // first_name
+    const FLAG_4: i32 = 1 << 4; // phone
     let mut w = Writer::new();
-    w.write_u32(USER_MIN);
+    w.write_u32(USER);
+    w.write_i32(FLAG_0 | FLAG_1 | FLAG_4); // flags
+    w.write_i32(0); // flags2
     w.write_i64(user.id);
-    w.write_i64(user.access_hash);
-    w.write_string(&user.first_name);
-    w.write_string(&user.last_name);
-    w.write_string(&user.phone);
+    w.write_i64(user.access_hash); // FLAG_0
+    w.write_string(&user.first_name); // FLAG_1
+    w.write_string(&user.phone); // FLAG_4
     w.into_vec()
+}
+
+/// Encode a minimal valid `config#cc1a241e` (flags = 0: all optional fields
+/// omitted). Field order verified against the client's `TL_config`.
+fn config(dc: &DcEndpoint) -> Vec<u8> {
+    let now = now_unix();
+    let mut w = Writer::new();
+    w.write_u32(CONFIG);
+    w.write_i32(0); // flags
+    w.write_i32(now); // date
+    w.write_i32(now + 3600); // expires
+    w.write_bool(false); // test_mode
+    w.write_i32(dc.dc_id); // this_dc
+    // dc_options: Vector<dcOption>
+    w.write_vector_header(1);
+    encode_dc_option(&mut w, dc);
+    w.write_string(""); // dc_txt_domain_name
+    for v in [
+        200,       // chat_size_max
+        200000,    // megagroup_size_max
+        100,       // forwarded_count_max
+        120000,    // online_update_period_ms
+        30000,     // offline_blur_timeout_ms
+        30000,     // offline_idle_timeout_ms
+        300000,    // online_cloud_timeout_ms
+        30000,     // notify_cloud_delay_ms
+        90000,     // notify_default_delay_ms
+        60000,     // push_chat_period_ms
+        10,        // push_chat_limit
+        172800,    // edit_time_limit
+        172800,    // revoke_time_limit
+        172800,    // revoke_pm_time_limit
+        2419200,   // rating_e_decay
+        20,        // stickers_recent_limit
+        92233720,  // channels_read_media_period
+    ] {
+        w.write_i32(v);
+    }
+    // flags.0 tmp_sessions omitted
+    for v in [
+        20000, // call_receive_timeout_ms
+        90000, // call_ring_timeout_ms
+        30000, // call_connect_timeout_ms
+        10000, // call_packet_timeout_ms
+    ] {
+        w.write_i32(v);
+    }
+    w.write_string("https://shuzagram.com/"); // me_url_prefix
+    // flags 7/9/10/11/12 strings omitted
+    w.write_i32(2048); // caption_length_max
+    w.write_i32(4096); // message_length_max
+    w.write_i32(dc.dc_id); // webfile_dc_id
+    // flags 2 (lang), 15 (reactions_default), 16 (autologin) omitted
+    w.into_vec()
+}
+
+fn encode_dc_option(w: &mut Writer, dc: &DcEndpoint) {
+    w.write_u32(DC_OPTION);
+    w.write_i32(0); // flags
+    w.write_i32(dc.dc_id); // id
+    w.write_string(&dc.ip); // ip_address
+    w.write_i32(dc.port); // port
+}
+
+fn now_unix() -> i32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i32)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -259,22 +364,36 @@ mod decode_helpers {
         r.read_string().unwrap().to_string()
     }
 
-    /// Decode the minimal auth.authorization -> User (test helper).
+    /// Decode auth.authorization -> User, mirroring the client's TL_user layout
+    /// for the flag set the server emits (FLAG_0 | FLAG_1 | FLAG_4).
     pub fn decode_authorization(result: &[u8]) -> User {
         let mut r = Reader::new(result);
         assert_eq!(r.read_u32().unwrap(), AUTH_AUTHORIZATION);
         let _flags = r.read_i32().unwrap();
-        assert_eq!(r.read_u32().unwrap(), USER_MIN);
+        assert_eq!(r.read_u32().unwrap(), USER);
+        let flags = r.read_i32().unwrap();
+        let _flags2 = r.read_i32().unwrap();
         let id = r.read_i64().unwrap();
-        let access_hash = r.read_i64().unwrap();
-        let first_name = r.read_string().unwrap().to_string();
-        let last_name = r.read_string().unwrap().to_string();
-        let phone = r.read_string().unwrap().to_string();
+        let access_hash = if flags & (1 << 0) != 0 {
+            r.read_i64().unwrap()
+        } else {
+            0
+        };
+        let first_name = if flags & (1 << 1) != 0 {
+            r.read_string().unwrap().to_string()
+        } else {
+            String::new()
+        };
+        let phone = if flags & (1 << 4) != 0 {
+            r.read_string().unwrap().to_string()
+        } else {
+            String::new()
+        };
         User {
             id,
             phone,
             first_name,
-            last_name,
+            last_name: String::new(),
             access_hash,
         }
     }
@@ -338,6 +457,48 @@ mod tests {
         assert_eq!(r.read_u32().unwrap(), PONG);
         assert_eq!(r.read_i64().unwrap(), 777); // pong.msg_id = request msg_id
         assert_eq!(r.read_i64().unwrap(), 0x1234); // ping_id echoed
+    }
+
+    #[test]
+    fn help_get_config_parses_exactly() {
+        let store = Arc::new(Store::new());
+        let d = Dispatcher::new(store);
+
+        let mut q = Writer::new();
+        q.write_u32(HELP_GET_CONFIG);
+        let out = d.handle_message(5, &invoke_with_layer(&q.into_vec()));
+        let (_req, result) = unwrap_rpc_result(&out[0]);
+
+        // Parse it exactly as the client's TL_config.readParams would (flags=0),
+        // and assert the whole buffer is consumed — any layout error shows up
+        // as leftover bytes or a short read.
+        let mut r = Reader::new(&result);
+        assert_eq!(r.read_u32().unwrap(), CONFIG);
+        assert_eq!(r.read_i32().unwrap(), 0); // flags
+        let _date = r.read_i32().unwrap();
+        let _expires = r.read_i32().unwrap();
+        let _test_mode = r.read_bool().unwrap();
+        let _this_dc = r.read_i32().unwrap();
+        let n = r.read_vector_header().unwrap();
+        for _ in 0..n {
+            assert_eq!(r.read_u32().unwrap(), DC_OPTION);
+            let _f = r.read_i32().unwrap();
+            let _id = r.read_i32().unwrap();
+            let _ip = r.read_string().unwrap();
+            let _port = r.read_i32().unwrap();
+        }
+        let _dc_txt = r.read_string().unwrap();
+        for _ in 0..17 {
+            r.read_i32().unwrap();
+        }
+        for _ in 0..4 {
+            r.read_i32().unwrap();
+        }
+        let _me_url = r.read_string().unwrap();
+        let _caption = r.read_i32().unwrap();
+        let _message = r.read_i32().unwrap();
+        let _webfile = r.read_i32().unwrap();
+        assert!(r.is_empty(), "config must be fully consumed (layout matches client)");
     }
 
     #[test]

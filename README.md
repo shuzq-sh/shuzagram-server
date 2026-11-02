@@ -17,7 +17,7 @@ and the server replies with `auth.authorization`. Proven end to end by
 | `mtproto-crypto` | AES-256-IGE, MTProto 2.0 KDF, `auth_key_id`/`msg_key`, PQ factorization, DH-2048, RSA_PAD | ✅ implemented + tested |
 | `tl-core` | TL wire (de)serialization (int/long/int128/int256/bytes/string/vector) | ✅ implemented + tested |
 | `gram-edge` | TCP transport + DH handshake + authenticated session loop + reference client | ✅ implemented + tested |
-| `gram-core` | encrypted session, RPC routing, `auth.sendCode` / `auth.signIn`, in-memory user store | ✅ implemented + tested |
+| `gram-core` | encrypted session, RPC routing, `help.getConfig`, `auth.sendCode` / `auth.signIn`, user store | ✅ implemented + tested |
 
 ### The road to "login works"
 
@@ -25,17 +25,17 @@ and the server replies with `auth.authorization`. Proven end to end by
 2. ✅ **TL serialization** — encode/decode the handshake and API constructors.
 3. ✅ **Edge + DH handshake** — client and server negotiate a shared `auth_key`.
 4. ✅ **auth.sendCode / signIn** — a phone number logs in and gets a user.
+5. ✅ **Schema-exact wire formats** — `help.getConfig` → `config#cc1a241e`,
+   `auth.sentCode#5e002502`, `auth.authorization#2ea2c0d4`, `user#b1b8cc83`,
+   all matching the ShuzaGram client's own `TLRPC.java` (verified by parsing
+   each reply byte-for-byte in `tests/tcp_login.rs`).
 
 Run the gateway: `EDGE_ADDR=0.0.0.0:8443 cargo run --release -p gram-edge`.
 It prints the RSA fingerprint the client must be configured to trust.
 
-> **Next (step 4b): stock-client interop.** The service/envelope layer
-> (handshake, encrypted messages, `msg_container`, `rpc_result`, `ping`) uses
-> the canonical MTProto ids. The high-level `auth.*` / `user` *bodies* are
-> currently a minimal self-consistent encoding; their exact Layer-232 wire
-> layout, plus `help.getConfig`, must be reconciled with the canonical schema
-> (and the ShuzaGram client pointed at this server's address + RSA key) before
-> the stock app can log in.
+> **Remaining for the live app:** point the ShuzaGram client at this server
+> (its address + the server's RSA public key), then build out persistence
+> (PostgreSQL per the master plan), `updates`/`pts`, and the messaging RPCs.
 
 ## Build
 
