@@ -713,6 +713,7 @@ impl Dispatcher {
             0x4ea4_c80f => self.account_get_connected_bots(ctx, r), // account.getConnectedBots
             0xf8b0_36af => self.channels_get_admined_public_channels(ctx, r), // channels.getAdminedPublicChannels
             0x8d96_92a3 => self.messages_get_web_page(ctx, r), // messages.getWebPage
+            0x8c4b_fe5d => self.messages_get_outbox_read_date(ctx, r), // messages.getOutboxReadDate
 
             0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
             0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername

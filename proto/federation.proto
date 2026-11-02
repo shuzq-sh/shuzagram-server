@@ -1,0 +1,333 @@
+syntax = "proto3";
+
+package gramsrv.federation.v1;
+
+option optimize_for = SPEED;
+
+// ============================================================================
+// Common Primitives
+// ============================================================================
+
+message PeerRef {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_USER = 1;
+    KIND_CHAT = 2;
+    KIND_CHANNEL = 3;
+  }
+  Kind kind = 1;
+  int64 id = 2;
+  int64 access_hash = 3;
+  uint32 home_dc_id = 4;
+}
+
+message EntityMinSnapshot {
+  int64 id = 1;
+  uint32 home_dc_id = 2;
+  int64 access_hash_seed = 3;
+  string username = 4;
+  string first_name = 5;
+  string last_name = 6;
+  string phone = 7;
+  uint64 flags_bitmask = 8; // verified, premium, bot, scam, fake
+  int64 photo_id = 9;
+  uint32 photo_dc_id = 10;
+}
+
+message SerializedTlPayload {
+  uint32 canonical_layer = 1; // Always 232 internally
+  uint32 constructor_id = 2;
+  bytes tl_bytes = 3;
+}
+
+// ============================================================================
+// 1. Cross-DC Direct & Basic-Group Relay
+// ============================================================================
+
+service CrossDcRelay {
+  rpc DeliverDirectMessage(DeliverDirectMessageRequest) returns (DeliverDirectMessageResponse);
+  rpc DeliverMessageEdit(DeliverMessageEditRequest) returns (DeliverMutationAck);
+  rpc DeliverMessageDelete(DeliverMessageDeleteRequest) returns (DeliverMutationAck);
+  rpc DeliverReadHistory(DeliverReadHistoryRequest) returns (DeliverMutationAck);
+  rpc DeliverTypingAction(DeliverTypingActionRequest) returns (EmptyAck);
+  rpc ResolvePeerProfile(ResolvePeerProfileRequest) returns (ResolvePeerProfileResponse);
+}
+
+message DeliverDirectMessageRequest {
+  string idempotency_key = 1; // "{origin_dc}:{sender_id}:{random_id}"
+  uint32 origin_dc_id = 2;
+  uint32 target_dc_id = 3;
+  EntityMinSnapshot sender = 4;
+  int64 recipient_user_id = 5;
+  int64 random_id = 6;
+  int32 date_unix = 7;
+  string message_text = 8;
+  SerializedTlPayload entities_tl = 9;
+  SerializedTlPayload media_tl = 10;
+  SerializedTlPayload reply_header_tl = 11;
+  SerializedTlPayload forward_header_tl = 12;
+  int32 ttl_period = 13;
+  uint64 message_flags = 14;
+}
+
+message DeliverDirectMessageResponse {
+  int32 recipient_msg_id = 1;
+  int32 recipient_pts = 2;
+  int32 date_unix = 3;
+}
+
+message DeliverMessageEditRequest {
+  string idempotency_key = 1;
+  uint32 origin_dc_id = 2;
+  int64 sender_user_id = 3;
+  int64 recipient_user_id = 4;
+  int64 random_id = 5;
+  int32 edit_date_unix = 6;
+  string new_text = 7;
+  SerializedTlPayload entities_tl = 8;
+  SerializedTlPayload media_tl = 9;
+}
+
+message DeliverMessageDeleteRequest {
+  string idempotency_key = 1;
+  uint32 origin_dc_id = 2;
+  int64 actor_user_id = 3;
+  int64 target_user_id = 4;
+  repeated int64 message_random_ids = 5;
+  bool revoke_for_both = 6;
+}
+
+message DeliverReadHistoryRequest {
+  uint32 origin_dc_id = 1;
+  int64 reader_user_id = 2;
+  int64 peer_user_id = 3;
+  int32 max_date_or_seq = 4;
+}
+
+message DeliverTypingActionRequest {
+  uint32 origin_dc_id = 1;
+  int64 actor_user_id = 2;
+  int64 target_user_id = 3;
+  SerializedTlPayload send_message_action_tl = 4;
+}
+
+message DeliverMutationAck {
+  bool applied = 1;
+  int32 new_pts = 2;
+}
+
+message EmptyAck {}
+
+message ResolvePeerProfileRequest {
+  PeerRef peer = 1;
+  int64 requester_user_id = 2;
+}
+
+message ResolvePeerProfileResponse {
+  bool found = 1;
+  EntityMinSnapshot entity = 2;
+  SerializedTlPayload full_entity_tl = 3;
+}
+
+// ============================================================================
+// 2. Cross-DC Auth & Home-DC Migration Federation
+// ============================================================================
+
+service AuthFederation {
+  rpc VerifyExportedAuth(VerifyExportedAuthRequest) returns (VerifyExportedAuthResponse);
+  rpc NotifyRemoteSessionTerminated(SessionRevokeNotice) returns (EmptyAck);
+  rpc MigrateUserHomeDc(MigrateUserHomeDcRequest) returns (MigrateUserHomeDcResponse);
+}
+
+message VerifyExportedAuthRequest {
+  uint32 requesting_dc_id = 1;
+  int64 user_id = 2;
+  bytes signed_ticket_bytes = 3;
+  int64 target_auth_key_id = 4;
+}
+
+message VerifyExportedAuthResponse {
+  bool valid = 1;
+  uint32 home_dc_id = 2;
+  uint64 dc_epoch = 3;
+  EntityMinSnapshot user_snapshot = 4;
+}
+
+message SessionRevokeNotice {
+  int64 user_id = 1;
+  repeated int64 revoked_auth_key_ids = 2;
+  bool revoke_all_except_hash = 3;
+  int64 keep_hash = 4;
+}
+
+message MigrateUserHomeDcRequest {
+  string migration_job_id = 1;
+  int64 user_id = 2;
+  uint32 source_dc_id = 3;
+  uint32 dest_dc_id = 4;
+  uint64 new_dc_epoch = 5;
+  bytes zstd_user_bundle = 6; // Atomic snapshot of user row, dialogs, recent messages, stars, pts
+}
+
+message MigrateUserHomeDcResponse {
+  bool committed = 1;
+  uint64 active_dc_epoch = 2;
+  int32 restored_pts = 3;
+}
+
+// ============================================================================
+// 3. Supergroup & Channel Origin-DC Federation
+// ============================================================================
+
+service ChannelFederation {
+  rpc PublishChannelMessage(PublishChannelMessageRequest) returns (PublishChannelMessageResponse);
+  rpc FetchChannelDifference(FetchChannelDifferenceRequest) returns (FetchChannelDifferenceResponse);
+  rpc MutateChannelMembership(MutateChannelMembershipRequest) returns (MutateChannelMembershipResponse);
+}
+
+message PublishChannelMessageRequest {
+  string idempotency_key = 1;
+  uint32 caller_dc_id = 2;
+  int64 channel_id = 3;
+  EntityMinSnapshot author = 4;
+  int64 random_id = 5;
+  string text = 6;
+  SerializedTlPayload entities_tl = 7;
+  SerializedTlPayload media_tl = 8;
+  int32 reply_to_msg_id = 9;
+  int32 top_topic_id = 10;
+}
+
+message PublishChannelMessageResponse {
+  int32 channel_msg_id = 1;
+  int32 channel_pts = 2;
+  int32 channel_pts_count = 3;
+  int32 date_unix = 4;
+}
+
+message FetchChannelDifferenceRequest {
+  int64 channel_id = 1;
+  int64 requester_user_id = 2;
+  int32 from_pts = 3;
+  int32 limit = 4;
+}
+
+message FetchChannelDifferenceResponse {
+  bool is_final = 1;
+  int32 latest_pts = 2;
+  repeated SerializedTlPayload new_messages_tl = 3;
+  repeated SerializedTlPayload other_updates_tl = 4;
+}
+
+message MutateChannelMembershipRequest {
+  int64 channel_id = 1;
+  int64 actor_user_id = 2;
+  int64 target_user_id = 3;
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_JOIN = 1;
+    ACTION_LEAVE = 2;
+    ACTION_BAN = 3;
+    ACTION_PROMOTE = 4;
+  }
+  Action action = 4;
+  SerializedTlPayload rights_tl = 5;
+}
+
+message MutateChannelMembershipResponse {
+  bool ok = 1;
+  int32 channel_pts = 2;
+}
+
+// ============================================================================
+// 4. Multi-DC Media Router
+// ============================================================================
+
+service MediaRouter {
+  rpc StreamFileChunk(StreamFileChunkRequest) returns (StreamFileChunkResponse);
+  rpc VerifyMediaReference(VerifyMediaReferenceRequest) returns (VerifyMediaReferenceResponse);
+}
+
+message StreamFileChunkRequest {
+  uint32 storage_dc_id = 1;
+  int64 volume_id = 2;
+  int64 file_id = 3;
+  int64 offset = 4;
+  int32 limit = 5;
+  bytes file_reference = 6;
+}
+
+message StreamFileChunkResponse {
+  bytes chunk_bytes = 1;
+  string mime_type = 2;
+  int32 mtime_unix = 3;
+  int64 total_size = 4;
+}
+
+message VerifyMediaReferenceRequest {
+  bytes file_reference = 1;
+  int64 file_id = 2;
+}
+
+message VerifyMediaReferenceResponse {
+  bool valid = 1;
+  uint32 owner_dc_id = 2;
+}
+
+// ============================================================================
+// 5. Control Plane & Node Telemetry Contract
+// ============================================================================
+
+service AdminControl {
+  rpc GetNodeHealth(EmptyAck) returns (NodeHealthReport);
+  rpc PushClusterConfig(ClusterConfigPush) returns (EmptyAck);
+  rpc SetRpcSnifferFilter(SnifferFilterSpec) returns ( stream DecodedRpcTraceEvent );
+  rpc ForceDisconnectAuthKey(ForceDisconnectRequest) returns (EmptyAck);
+}
+
+message NodeHealthReport {
+  string node_id = 1;
+  string role = 2; // "edge", "core", "egress", "media", "sfu"
+  uint32 dc_id = 3;
+  uint64 active_connections = 4;
+  uint64 inflight_rpcs = 5;
+  double cpu_usage_pct = 6;
+  uint64 rss_bytes = 7;
+  map<uint32, uint32> inter_dc_rtt_micros = 8;
+  uint64 uptime_seconds = 9;
+}
+
+message ClusterConfigPush {
+  uint64 config_version = 1;
+  bytes serialized_config_json = 2;
+  bool broadcast_update_config = 3;
+}
+
+message SnifferFilterSpec {
+  uint32 sample_rate_per_myriad = 1; // 1..10000 (10000 = 100% for targeted user_id)
+  int64 filter_user_id = 2;          // 0 = any
+  uint32 filter_dc_id = 3;           // 0 = any
+  uint32 filter_constructor_id = 4;  // 0 = any
+  bool errors_only = 5;
+}
+
+message DecodedRpcTraceEvent {
+  uint64 trace_id = 1;
+  int64 timestamp_micros = 2;
+  uint32 dc_id = 3;
+  string edge_node_id = 4;
+  int64 user_id = 5;
+  int64 auth_key_id = 6;
+  uint32 client_layer = 7;
+  uint32 constructor_id = 8;
+  string method_name = 9;
+  uint32 duration_micros = 10;
+  int32 rpc_error_code = 11; // 0 = OK
+  string rpc_error_message = 12;
+  string payload_preview_json = 13;
+}
+
+message ForceDisconnectRequest {
+  int64 auth_key_id = 1;
+  uint32 dc_id = 2;
+}

@@ -3256,6 +3256,14 @@ impl Dispatcher {
         w.write_i64(0); // id
         w.into_vec()
     }
+
+    // messages.getOutboxReadDate#8c4bfe5d peer:InputPeer msg_id:int = OutboxReadDate
+    pub fn messages_get_outbox_read_date(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(0x3bb8_42ac); // outboxReadDate#3bb842ac
+        w.write_i32(now_unix());
+        w.into_vec()
+    }
 }
 
 fn parse_input_file(r: &mut Reader) -> Option<(i64, usize, String)> {
