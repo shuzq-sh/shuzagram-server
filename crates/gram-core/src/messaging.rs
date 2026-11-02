@@ -122,6 +122,8 @@ pub const TL_STORIES_ALBUMS: u32 = 0xc398_7a3a;
 pub const TL_MESSAGES_SAVED_REACTION_TAGS: u32 = 0x3259_950a;
 pub const TL_MESSAGES_EXPORTED_CHAT_INVITES: u32 = 0xbdc6_2dcc;
 pub const TL_CONTACTS_SPONSORED_PEERS_EMPTY: u32 = 0xea32_b4b1;
+pub const TL_ACCOUNT_THEMES: u32 = 0x9a3d_8c6d;
+pub const TL_ACCOUNT_WEB_BROWSER_SETTINGS: u32 = 0x79eb_8cb3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedPeer {
@@ -2661,6 +2663,21 @@ impl Dispatcher {
     pub fn contacts_get_sponsored_peers(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
         let mut w = Writer::new();
         w.write_u32(TL_CONTACTS_SPONSORED_PEERS_EMPTY);
+        w.into_vec()
+    }
+
+    pub fn account_get_themes(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_ACCOUNT_THEMES);
+        w.write_i64(0); // hash
+        w.write_vector_header(0); // themes
+        w.into_vec()
+    }
+
+    pub fn account_get_web_browser_settings(&self, _ctx: &mut ConnContext, _r: &mut Reader) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u32(TL_ACCOUNT_WEB_BROWSER_SETTINGS);
+        w.write_i32(0); // flags: 0
         w.into_vec()
     }
 }

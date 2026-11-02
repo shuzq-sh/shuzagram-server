@@ -675,6 +675,8 @@ impl Dispatcher {
             0x7851_5775 => self.account_update_profile(ctx, r),   // account.updateProfile
             0x2714_d86c => self.account_check_username(ctx, r),   // account.checkUsername
             0x3e0b_dd7c => self.account_update_username(ctx, r),  // account.updateUsername
+            0x7206_e458 => self.account_get_themes(ctx, r),       // account.getThemes
+            0x5665_5768 => self.account_get_web_browser_settings(ctx, r), // account.getWebBrowserSettings
 
             CONTACTS_GET_CONTACTS => self.contacts_get_contacts(ctx, r),
             0x2c80_0be5 => self.contacts_import_contacts(ctx, r), // contacts.importContacts
